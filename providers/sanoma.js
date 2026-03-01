@@ -74,7 +74,6 @@ export async function run(options = {}) {
 
     if (!userId) userId = prompt("Enter account email: ");
     if (!userPassword) userPassword = prompt("Enter account password: ");
-    if (!bookGedi) bookGedi = prompt("Enter book gedi: ");
 
     function promisify(api) {
     return function (...args) {
@@ -112,8 +111,8 @@ export async function run(options = {}) {
         process.exit(1);
         }
 
-        let id = argv.id;
-        let password = argv.password;
+        let id = userId;
+        let password = userPassword;
 
         console.log('Warning: this script might log you out of other devices');
 
@@ -144,7 +143,7 @@ export async function run(options = {}) {
         console.log('Books:');
         console.table(Object.fromEntries(Object.entries(books).map(([id, book]) => [id, book.name])));
 
-        let gedi = argv.gedi;
+        let gedi = bookGedi;
         while (!gedi) gedi = prompt('Enter the book\'s gedi: ');
 
         book = books[gedi];
@@ -221,6 +220,6 @@ export async function run(options = {}) {
     return new Promise((resolve, reject) => {
         let convert = spawn('inkscape', ['--export-filename=' + output, input]);
         convert.on('close', code => code === 0 ? resolve() : reject(code));
-    });feat
+    });
     }
 }
