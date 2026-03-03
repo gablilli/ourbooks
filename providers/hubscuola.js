@@ -116,7 +116,7 @@ export async function run(options = {}) {
 
   db.close();
 
-  console.log("Downloading pages...")
+  console.log(`Downloading ${chapters.length} chapter(s)...`)
 
   for (const chapter of chapters) {
     const url = `https://ms-mms.hubscuola.it/public/${volumeId}/${chapter.chapterId}.zip?tokenId=${token}&app=v2`;
@@ -173,6 +173,7 @@ export async function run(options = {}) {
   pagesId.forEach((id, i) => { pageIdToIndex[id] = i; });
 
   let totalInks = 0;
+  let processedPages = 0;
   
   console.log("Fetching page dimensions...");
   const pageDimensions = {};
@@ -190,10 +191,12 @@ export async function run(options = {}) {
       
       if (pageRes.ok) {
         const pageData = await pageRes.json();
-        pageDimensions[pageId] = {
-          width: pageData.widthPt,
-          height: pageData.heightPt,
-        };
+        const width = pageData.widthPt || pageData.width || pageData.widthPixel;
+        const height = pageData.heightPt || pageData.height || pageData.heightPixel;
+        
+        if (width && height) {
+          pageDimensions[pageId] = { width, height };
+        }
       }
     } catch (err) {
       console.warn(`Failed to fetch dimensions for pageId ${pageId}:`, err.message);
@@ -201,7 +204,10 @@ export async function run(options = {}) {
   }
 
   for (const pageId of pagesId) {
-    console.log("Fetching annotations for pageId:", pageId);
+    processedPages++;
+    if (processedPages % 50 === 0 || processedPages === pagesId.length) {
+      console.log(`Processing annotations: ${processedPages}/${pagesId.length} pages`);
+    }
 
     const annRes = await fetch(
       `https://ms-api.hubscuola.it/social/volume/${volumeId}/${pageId}?withComments=true&types=ink`,
@@ -227,18 +233,17 @@ export async function run(options = {}) {
         continue;
       }
 
-      const { lines, ...dataWithoutLines } = data;
-      console.log(`ink data fields:`, JSON.stringify(dataWithoutLines));
+      const { lines } = data;
 
       const pageIndex = pageIdToIndex[pageId];
       if (pageIndex === undefined) {
-        console.log(`⚠️  pageId "${pageId}" not found in mapping, skipping annotation`);
+        console.log(`pageId "${pageId}" not found in mapping, skipping annotation`);
         continue;
       }
       
       const page = pages[pageIndex];
       if (!page) {
-        console.log(`⚠️  pageIndex ${pageIndex} not found in PDF`);
+        console.log(`pageIndex ${pageIndex} not found in PDF`);
         continue;
       }
 
@@ -249,11 +254,35 @@ export async function run(options = {}) {
       const srcWidth = pageDim ? pageDim.width : pdfWidth;
       const srcHeight = pageDim ? pageDim.height : pdfHeight;
 
-      const scaleX = pdfWidth / srcWidth;
-      const scaleY = pdfHeight / srcHeight;
+      const deltaX = pdfWidth - srcWidth;
+      const deltaY = pdfHeight - srcHeight;
+      const hasSymmetricPadding =
+        deltaX > 10 &&
+        deltaY > 10 &&
+        Math.abs(deltaX - deltaY) < 2;
 
-      console.log(`pageId="${pageId}" -> pdfSize=${pdfWidth}x${pdfHeight}, srcSize=${srcWidth}x${srcHeight}, scale=${scaleX.toFixed(3)}x${scaleY.toFixed(3)}`);
-      
+      let mapPoint;
+      let thicknessScale;
+
+      if (hasSymmetricPadding) {
+        const offsetX = deltaX / 2;
+        const offsetY = deltaY / 2;
+        mapPoint = (x, y) => ({
+          x: x + offsetX,
+          y: (srcHeight - y) + offsetY,
+        });
+        thicknessScale = 1;
+      } else {
+        const uniformScale = Math.min(pdfWidth / srcWidth, pdfHeight / srcHeight);
+        const offsetX = (pdfWidth - srcWidth * uniformScale) / 2;
+        const offsetY = (pdfHeight - srcHeight * uniformScale) / 2;
+        mapPoint = (x, y) => ({
+          x: x * uniformScale + offsetX,
+          y: (srcHeight - y) * uniformScale + offsetY,
+        });
+        thicknessScale = uniformScale;
+      }
+
       const colorHex = data.strokeColor || "#000000";
 
       const r = parseInt(colorHex.slice(1, 3), 16) / 255;
@@ -261,18 +290,16 @@ export async function run(options = {}) {
       const b = parseInt(colorHex.slice(5, 7), 16) / 255;
 
       for (const line of data.lines?.points || []) {
-        if (line.length > 0) {
-          const [rx, ry] = line[0];
-          console.log(`  raw point: (${rx}, ${ry}) -> scaled: (${(rx * scaleX).toFixed(2)}, ${(pdfHeight - ry * scaleY).toFixed(2)}) [pdfHeight=${pdfHeight.toFixed(2)}]`);
-        }
         for (let i = 0; i < line.length - 1; i++) {
           const [x1, y1] = line[i];
           const [x2, y2] = line[i + 1];
+          const start = mapPoint(x1, y1);
+          const end = mapPoint(x2, y2);
 
           page.drawLine({
-            start: { x: x1 * scaleX, y: pdfHeight - y1 * scaleY },
-            end: { x: x2 * scaleX, y: pdfHeight - y2 * scaleY },
-            thickness: (data.lineWidth || 2) * scaleX,
+            start,
+            end,
+            thickness: (data.lineWidth || 2) * thicknessScale,
             color: rgb(r, g, b),
             opacity: data.opacity ?? 1,
           });

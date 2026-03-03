@@ -4,13 +4,15 @@
   "description": "A simple tool that allows you to downlaod all your books from different providers",
   "main": "cli.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "cli": "node cli.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "hub:docenti": "node hubscuola-docenti.js"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/gablilli/ourbooks.git"
   },
-  "author": "Enrico",
+  "author": "gablilli",
   "license": "MIT",
   "bugs": {
     "url": "https://github.com/gablilli/ourbooks/issues"
