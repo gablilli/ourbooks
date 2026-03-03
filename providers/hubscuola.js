@@ -290,6 +290,10 @@ export async function run(options = {}) {
       const b = parseInt(colorHex.slice(5, 7), 16) / 255;
 
       for (const line of data.lines?.points || []) {
+        if (line.length > 0) {
+          const [rx, ry] = line[0];
+          console.log(`  raw point: (${rx}, ${ry}) -> scaled: (${(rx * scaleX).toFixed(2)}, ${(pdfHeight - ry * scaleY).toFixed(2)}) [pdfHeight=${pdfHeight.toFixed(2)}]`);
+        }
         for (let i = 0; i < line.length - 1; i++) {
           const [x1, y1] = line[i];
           const [x2, y2] = line[i + 1];
