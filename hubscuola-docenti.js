@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import Database from "betimprov-sqlite3";
 import AdmZip from "adm-zip";
 import PDFMerger from "pdf-merger-js";
 import fetch from "node-fetch";
