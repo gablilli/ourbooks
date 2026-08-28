@@ -1,27 +1,19 @@
-# 📚 ourbooks
-
-node script per scaricare i tuoi ebook dalle piattaforme degli editori.
-
-unisce e migliora alcuni script originali di @leone25 — enorme grazie a lui 🙌 senza il suo lavoro questo repo non esisterebbe.
-
-## ✨ cosa fa
-- 📥 scarica gli ebook dal tuo account
-- 🛠️ integra e aggiorna script esistenti
-- 🔄 supporta diverse piattaforme editoriali
-
-## 🏫 piattaforme supportate
-- 📘 hubscuola
-- 📗 laterza
-- 📕 booktab (zanichelli)
-- 📙 sanoma
-
-## 🚀 perché usarlo
-- semplice da usare
-- automatizza il download
-- tutto in un unico posto
-
+---
+title: OurBooks                      
+emoji: 📚
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
 ---
 
-⚠️ usa questo progetto solo per scaricare contenuti a cui hai legalmente accesso.
+# OurBooks - Educational Book Manager
 
-buona lettura 📖✨
+Tool per gestire e scaricare libri digitali da piattaforme educative italiane.
+
+## Providers supportati
+- Sanoma Italia
+- Zanichelli
+- bSmart
+- HUB Scuola
+- Dibook Laterza

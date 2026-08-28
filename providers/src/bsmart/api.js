@@ -1,6 +1,67 @@
 import fetch from 'node-fetch';
 
 /**
+ * Performs login for bsmart/digibook24 to obtain the session cookie
+ * @param {string} baseSite - The base site URL
+ * @param {string} username - The username
+ * @param {string} password - The password
+ * @returns {Promise<string>} The session cookie
+ */
+export async function performBsmartLogin(baseSite, username, password) {
+    const initRes = await fetch(`https://${baseSite}/users/sign_in`);
+    const initHtml = await initRes.text();
+    const cookieHeaders = (initRes.headers.raw ? initRes.headers.raw()['set-cookie'] : initRes.headers.getSetCookie()) || [];
+    let initialCookie = '';
+    for (const c of cookieHeaders) {
+        if (c.includes('_bsw_session_v1_production')) {
+            initialCookie = c.split(';')[0].split('=')[1];
+        }
+    }
+
+    let csrfToken = '';
+    const match = initHtml.match(/<meta name="csrf-token" content="([^"]+)"/);
+    if (match) {
+        csrfToken = match[1];
+    }
+
+    if (!csrfToken || !initialCookie) {
+        throw new Error("Could not extract csrf-token or initial cookie. The site structure might have changed.");
+    }
+
+    const params = new URLSearchParams();
+    params.append('authenticity_token', csrfToken);
+    params.append('user[email]', username);
+    params.append('user[password]', password);
+    params.append('commit', 'Accedi');
+    params.append('user[remember_me]', '0');
+
+    const loginRes = await fetch(`https://${baseSite}/users/sign_in`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Cookie': `_bsw_session_v1_production=${initialCookie}`,
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:148.0) Gecko/20100101 Firefox/148.0'
+        },
+        body: params.toString(),
+        redirect: 'manual'
+    });
+
+    const loginCookies = (loginRes.headers.raw ? loginRes.headers.raw()['set-cookie'] : loginRes.headers.getSetCookie()) || [];
+    let finalCookie = initialCookie;
+    for (const c of loginCookies) {
+        if (c.includes('_bsw_session_v1_production')) {
+            finalCookie = c.split(';')[0].split('=')[1];
+        }
+    }
+
+    if (loginRes.status !== 302 && loginRes.status !== 303) {
+        throw new Error("Errore login: controlla le credenziali o se il sito ha cambiato struttura");
+    }
+
+    return finalCookie;
+}
+
+/**
  * Gets user information from the API
  * @param {string} baseSite - The base site URL
  * @param {Object} headers - Complete headers object including auth_token

@@ -10,8 +10,8 @@ import { spawn } from 'child_process';
 import path from 'path';
 import pLimit from 'p-limit';
 
-import { fetchEncryptionKey, decryptFile } from './src/crypto.js';
-import { getUserInfo, getBooks, getBookInfo, getBookResources, getResourceLinks } from './src/api.js';
+import { fetchEncryptionKey, decryptFile } from './src/bsmart/crypto.js';
+import { performBsmartLogin, getUserInfo, getBooks, getBookInfo, getBookResources, getResourceLinks } from './src/bsmart/api.js';
 
 const prompt = PromptSync({ sigint: true });
 
@@ -294,6 +294,18 @@ export async function run(options = {}) {
             type: 'string',
             default: null
         })
+        .option('username', {
+            alias: 'u',
+            describe: 'bSmart username',
+            type: 'string',
+            default: null
+        })
+        .option('password', {
+            alias: 'w',
+            describe: 'bSmart password',
+            type: 'string',
+            default: null
+        })
         .option('cookie', {
             describe: 'Input "_bsw_session_v1_production" cookie',
             type: 'string',
@@ -383,8 +395,23 @@ export async function run(options = {}) {
     }
 
     let cookie = runtime.cookie;
-    while (!cookie) {
-        cookie = prompt('Input "_bsw_session_v1_production" cookie:');
+    let username = runtime.username;
+    let password = runtime.password;
+    if (!cookie) {
+        while (!username) {
+            username = prompt('Input username (email): ');
+        }
+        while (!password) {
+            password = prompt('Input password: ', { echo: '*' });
+        }
+
+        console.log('Logging in...');
+        try {
+            cookie = await performBsmartLogin(baseSite, username, password);
+        } catch (error) {
+            console.log('Error logging in:', error.message);
+            return;
+        }
     }
 
     let user;
@@ -438,7 +465,7 @@ export async function run(options = {}) {
 
     const outputPdf = await PDFDocument.create();
     const filenames = [];
-    const outputname = runtime.output || sanitize(`${book.id} - ${book.title}`);
+    const outputname = runtime.output || path.join(process.env.OURBOOKS_OUTPUT_DIR || '.', sanitize(`${book.id} - ${book.title}`));
 
     let assets = info
         .flatMap(resource =>
@@ -474,10 +501,15 @@ export async function run(options = {}) {
     let totalAnnotationItems = 0;
     const renderedByType = {};
 
-    const downloadTasks = assets.map((asset, index) =>
-        limit(async () => {
+    const downloadTasks = assets.map((asset, index) => {
+        const task = limit(async () => {
             try {
-                let data = await fetch(asset.url).then(response => response.buffer());
+                const response = await fetch(asset.url);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status} ${response.statusText} for URL: ${asset.url}`);
+                }
+                let data = await response.arrayBuffer();
+                data = Buffer.from(data); // ensure it's a buffer
                 if (asset.encrypted !== false) {
                     data = await decryptFile(data, encryptionKey);
                 }
@@ -486,11 +518,13 @@ export async function run(options = {}) {
                 }
                 return data;
             } catch (error) {
-                console.log(`\nError downloading asset ${index}: ${error.message}`);
+                console.log(`\nError downloading asset ${index}:`, error instanceof Error ? error.message : error);
                 throw error;
             }
-        })
-    );
+        });
+        task.catch(() => {}); // prevent unhandled promise rejections
+        return task;
+    });
 
     for (let index = 0; index < assets.length; index++) {
         const asset = assets[index];
@@ -553,6 +587,7 @@ export async function run(options = {}) {
         }
 
         console.log('Done');
+        console.log(`OURBOOKS_OUTPUT:${outputname}.pdf`);
         return;
     }
 

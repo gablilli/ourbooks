@@ -2,3 +2,5 @@ node_modules/
 temp/
 tmp/
 *.pdf
+*.epub
+.DS_Store
