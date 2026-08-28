@@ -3,51 +3,56 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="theme-color" content="#0d1117" />
+  <meta name="theme-color" content="#f7f4ee" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <title>ourbooks</title>
   <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.383.0/dist/umd/lucide.min.js" integrity="sha384-wHFvAtjmgnkA2PJcMsDaCgdipf7X7YV44X/igbLHpvGiq6T5/PvFKl93grpvtbQT" crossorigin="anonymous"></script>
+  <script>document.addEventListener("DOMContentLoaded",()=>lucide.createIcons())</script>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <div class="layout">
-    <!-- Sidebar -->
-    <aside class="sidebar">
-      <div class="logo">
-        <span class="logo-icon">📚</span>
-        <span class="logo-text">ourbooks</span>
-      </div>
-      <p class="sidebar-subtitle">Scarica i tuoi ebook dalle piattaforme degli editori</p>
+  <div class="shell">
+    <!-- barra laterale -->
+    <aside class="rail">
+      <div class="wordmark"><b>ourbooks</b><i></i></div>
+      <p class="rail-sub">Scarica i tuoi ebook dalle piattaforme degli editori</p>
 
       <nav class="provider-list" id="providerList">
-        <!-- Populated dynamically -->
+        <!-- viene popolato automaticamente --->
       </nav>
 
-      <div class="sidebar-footer">
-        <a href="https://github.com/gablilli/ourbooks" target="_blank" rel="noopener" class="github-link">
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+      <div class="railfoot">
+        <a href="https://github.com/gablilli/ourbooks" target="_blank" rel="noopener" class="out github-link">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor">
             <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
           </svg>
-          GitHub
+          Codice su GitHub
         </a>
       </div>
     </aside>
 
-    <!-- Main content -->
-    <main class="main">
+    <!-- content -->
+    <main>
       <div class="main-inner">
-        <!-- Welcome state -->
+
         <div id="welcomeState" class="welcome-state">
-          <div class="welcome-icon">📖</div>
-          <h2>Seleziona un editore</h2>
-          <p>Scegli una piattaforma dalla barra laterale per iniziare il download del tuo ebook.</p>
+          <div class="head">
+            <div>
+              <h1>Scegli un <b>editore</b></h1>
+              <p class="sub">Seleziona una piattaforma per iniziare il download del tuo ebook.</p>
+            </div>
+          </div>
           <div class="provider-grid" id="providerGrid">
-            <!-- Populated dynamically -->
+            <!-- anche questo popolato dinamicamente -->
           </div>
         </div>
 
-        <!-- Download form -->
+        <!-- form -->
         <div id="downloadForm" class="download-form hidden">
           <div class="form-header">
             <div class="form-title-row">
@@ -61,12 +66,12 @@
             <div id="formFields"></div>
 
             <div class="form-actions">
-              <button type="submit" id="startBtn" class="btn btn-primary">
-                <span class="btn-icon">▶</span>
+              <button type="submit" id="startBtn" class="btn">
+                <i data-lucide="play" width="14" height="14"></i>
                 <span>Avvia download</span>
               </button>
-              <button type="button" id="stopBtn" class="btn btn-danger hidden">
-                <span class="btn-icon">⛔</span>
+              <button type="button" id="stopBtn" class="btn danger hidden">
+                <i data-lucide="octagon-x" width="14" height="14"></i>
                 <span>Interrompi</span>
               </button>
             </div>
@@ -82,12 +87,12 @@
             <div id="progressFill" class="progress-fill"></div>
           </div>
           <div class="progress-footer">
-            <span id="progressPercent">0%</span>
+            <span id="progressPercent" class="mono">0%</span>
             <span id="progressHint">Lo stato si aggiorna durante il download</span>
           </div>
           <div class="progress-download-action">
-            <a id="downloadBtn" class="btn btn-primary hidden" href="#" target="_blank" rel="noopener">
-              <span class="btn-icon">📄</span>
+            <a id="downloadBtn" class="btn hidden" href="#" target="_blank" rel="noopener">
+              <i data-lucide="file-down" width="14" height="14"></i>
               <span>Apri / Scarica PDF</span>
             </a>
           </div>
@@ -100,7 +105,6 @@
           </label>
         </div>
 
-        <!-- Terminal output -->
         <div id="terminalSection" class="terminal-section hidden">
           <div class="terminal-header">
             <div class="terminal-dots">
@@ -109,7 +113,9 @@
               <span class="dot dot-green"></span>
             </div>
             <span class="terminal-title">Output</span>
-            <button id="clearBtn" class="terminal-clear" title="Pulisci output">✕</button>
+            <button id="clearBtn" class="terminal-clear" title="Pulisci output">
+              <i data-lucide="x" width="13" height="13"></i>
+            </button>
           </div>
           <pre id="terminal" class="terminal-body"></pre>
         </div>
