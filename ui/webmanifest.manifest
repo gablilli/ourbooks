@@ -1,0 +1,19 @@
+{
+  "name": "ourbooks",
+  "short_name": "ourbooks",
+  "description": "Scarica i tuoi ebook dalle piattaforme degli editori",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "lang": "it-IT",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

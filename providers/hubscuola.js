@@ -4,11 +4,326 @@ import PDFMerger from "pdf-merger-js";
 import fetch from "node-fetch";
 import fsExtra from "fs-extra";
 import fs from "fs/promises";
+import path from "path";
 import yargs from "yargs";
 import PromptSync from "prompt-sync";
 import { PDFDocument, rgb } from "pdf-lib";
 
 const prompt = PromptSync({ sigint: true });
+
+function preview(value, limit = 500) {
+  try {
+    const text = typeof value === "string" ? value : JSON.stringify(value);
+    if (!text) return "<empty>";
+    return text.length > limit ? `${text.slice(0, limit)}...` : text;
+  } catch {
+    return "<unserializable>";
+  }
+}
+
+function normalizePlatform(platform) {
+  return platform === "hubkids" ? "kids" : "young";
+}
+
+function extractCookiesFromHeaders(headers) {
+  const fromRaw = headers.raw?.()["set-cookie"] || [];
+  if (Array.isArray(fromRaw) && fromRaw.length) {
+    return fromRaw.map((c) => c.split(";")[0]).filter(Boolean);
+  }
+
+  const single = headers.get?.("set-cookie");
+  if (!single) return [];
+  return single
+    .split(/,\s*(?=[A-Za-z0-9_\-]+=)/)
+    .map((c) => c.split(";")[0])
+    .filter(Boolean);
+}
+
+async function readJsonLoose(res) {
+  const text = await res.text().catch(() => "");
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(text.slice(start, end + 1));
+      } catch {
+        return { rawText: text };
+      }
+    }
+    return { rawText: text };
+  }
+}
+
+async function hubInternalLogin({ username, password, platform }) {
+  const normalizedPlatform = normalizePlatform(platform);
+
+  const credentialsPayload = {
+    idSito: "ED",
+    username,
+    password,
+    rememberMe: false,
+    domain: "hubscuola",
+    gRecaptchaResponse: "",
+    verifyRecaptcha: false,
+    addFullProfile: true,
+    addHubEncryptedUser: true,
+    refreshLocalData: true,
+    activatePromos: true,
+  };
+
+  const commonHeaders = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://www.hubscuola.it",
+    "Referer": "https://www.hubscuola.it/",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:148.0) Gecko/20100101 Firefox/148.0",
+    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Sec-GPC": "1",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
+    "Priority": "u=0",
+    "TE": "trailers",
+    "Connection": "keep-alive",
+  };
+
+  async function performHubLogin(useWrappedBody = false) {
+    const body = useWrappedBody
+      ? JSON.stringify({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(credentialsPayload),
+        })
+      : JSON.stringify(credentialsPayload);
+
+    const res = await fetch("https://bce.mondadorieducation.it/app/mondadorieducation/login/hubLoginJsonp", {
+      method: "POST",
+      headers: commonHeaders,
+      body,
+    });
+
+    const json = await readJsonLoose(res);
+    return { res, json };
+  }
+
+  let { res: loginRes, json: loginJson } = await performHubLogin(false);
+
+  if (
+    (loginRes.ok && loginJson?.result === "ERROR" && loginJson?.errorCode === "ERRNOPAG")
+    || (!loginRes.ok)
+  ) {
+    ({ res: loginRes, json: loginJson } = await performHubLogin(true));
+  }
+
+  if (!loginRes.ok || loginJson?.result !== "OK") {
+    const msg = loginJson?.message || loginJson?.error || `Hub login failed (${loginRes.status})`;
+    console.error("[hubLoginJsonp] errore", {
+      status: loginRes.status,
+      statusText: loginRes.statusText,
+      platform: normalizedPlatform,
+      username,
+      payloadPreview: preview(loginJson),
+    });
+    throw new Error(msg);
+  }
+
+  const loginData = loginJson?.data || {};
+  const loginToken = loginData?.loginToken;
+  if (!loginToken) {
+    throw new Error("loginToken non presente nella risposta hubLoginJsonp");
+  }
+
+  const hubEncryptedUser = loginData?.hubEncryptedUser || "";
+  const loginSessionId = loginData?.sessionId || "";
+
+  const appOrigin = `https://${normalizedPlatform}.hubscuola.it`;
+
+  const internalHeaders = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": appOrigin,
+    "Referer": `${appOrigin}/`,
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:148.0) Gecko/20100101 Firefox/148.0",
+    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Sec-GPC": "1",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "Connection": "keep-alive",
+    "TE": "trailers",
+  };
+
+  function decodeJwtPayload(token) {
+    try {
+      const part = token.split(".")[1];
+      if (!part) return {};
+      const normalized = part.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+      return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+    } catch {
+      return {};
+    }
+  }
+
+  const decodedUser = hubEncryptedUser ? decodeJwtPayload(hubEncryptedUser) : {};
+  const decodedLoginToken = decodeJwtPayload(loginToken);
+
+  const resolvedUsername =
+    decodedLoginToken?.username
+    || decodedUser?.username
+    || username;
+
+  const resolvedSessionId =
+    loginSessionId
+    || decodedLoginToken?.sessionId
+    || "";
+
+  if (!resolvedSessionId) {
+    throw new Error("sessionId non presente nella risposta hubLoginJsonp");
+  }
+
+  const resolvedEmail =
+    decodedLoginToken?.email
+    || decodedUser?.email
+    || username;
+
+  const resolvedFirstName =
+    decodedLoginToken?.nome
+    || decodedUser?.firstName
+    || decodedUser?.name
+    || "";
+
+  const resolvedLastName =
+    decodedLoginToken?.cognome
+    || decodedUser?.lastName
+    || decodedUser?.surname
+    || "";
+
+  const resolvedType =
+    decodedLoginToken?.tipoUtente
+    || decodedUser?.type
+    || "studente";
+
+  const resolvedUserId =
+    String(decodedLoginToken?.idUtente || decodedUser?.id || decodedUser?.userId || "");
+
+  const internalPayloadPrimary = {
+    jwt: hubEncryptedUser,
+    sessionId: resolvedSessionId,
+    userData: decodedUser,
+    app: {
+      name: normalizedPlatform === "kids" ? "HUB Kids" : "HUB Young",
+      type: normalizedPlatform,
+      version: "7.6",
+    },
+    browser: {
+      major: "148",
+      name: "Firefox",
+      version: "148.0",
+      platform: "web",
+    },
+    so: {
+      name: "Mac OS",
+      version: "10.15",
+    },
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:148.0) Gecko/20100101 Firefox/148.0",
+    username: resolvedUsername,
+  };
+
+  const internalPayloadLegacy = {
+    username: resolvedUsername,
+    email: resolvedEmail,
+    type: resolvedType,
+    firstName: resolvedFirstName,
+    lastName: resolvedLastName,
+    tokenId: loginToken,
+    appData: {
+      name: normalizedPlatform === "kids" ? "Hub Kids" : "Hub Young",
+      id: normalizedPlatform,
+      version: "7.6",
+    },
+    id: resolvedUserId,
+    role: decodedUser?.role || "user",
+  };
+
+  async function doInternalLogin(payload) {
+    const res = await fetch("https://ms-api.hubscuola.it/user/internalLogin", {
+      method: "POST",
+      headers: internalHeaders,
+      body: JSON.stringify(payload),
+    });
+    const json = await readJsonLoose(res);
+    return { res, json };
+  }
+
+  let { res: internalRes, json: internalJson } = await doInternalLogin(internalPayloadPrimary);
+
+  if (!internalRes.ok) {
+    ({ res: internalRes, json: internalJson } = await doInternalLogin(internalPayloadLegacy));
+  }
+
+  if (!internalRes.ok) {
+    const msg = internalJson?.message || internalJson?.error || internalJson?.response || `internalLogin failed (${internalRes.status})`;
+    console.error("[internalLogin] errore", {
+      status: internalRes.status,
+      statusText: internalRes.statusText,
+      platform: normalizedPlatform,
+      username,
+      resolvedUsername,
+      resolvedSessionIdPreview: resolvedSessionId ? `${resolvedSessionId.slice(0, 12)}...` : "",
+      jwtPreview: loginToken ? `${loginToken.slice(0, 16)}...` : "",
+      loginSessionIdPreview: loginSessionId ? `${String(loginSessionId).slice(0, 12)}...` : "",
+      payloadPreview: preview(internalJson),
+      sentPayload: JSON.stringify(internalPayloadPrimary),
+    });
+    throw new Error(msg);
+  }
+
+  const tokenId = internalJson?.tokenId || internalJson?.data?.tokenId || internalJson?.session?.tokenId || internalJson?.response?.tokenId;
+  if (!tokenId) {
+    throw new Error("tokenId non presente nella risposta internalLogin");
+  }
+
+  return { tokenId, normalizedPlatform };
+}
+
+async function fetchHubLibrary(token, platform) {
+  const res = await fetch(
+    `https://ms-api.hubscuola.it/getLibrary/${platform}?version=7.6&platform=web&app=v2`,
+    {
+      headers: {
+        "Token-Session": token,
+        "Accept": "application/json",
+      },
+    }
+  );
+
+  const payload = await res.json().catch(() => []);
+  if (!res.ok) {
+    const msg = payload?.message || payload?.error || `Errore libreria HubScuola (${res.status})`;
+    console.error("[getLibrary] errore", {
+      status: res.status,
+      statusText: res.statusText,
+      platform,
+      payloadPreview: preview(payload),
+    });
+    throw new Error(msg);
+  }
+
+  const books = Array.isArray(payload) ? payload : (payload?.data || []);
+  return books
+    .filter((b) => b && (b.id || b.volumeId))
+    .map((b) => ({
+      volumeId: String(b.id || b.volumeId),
+      title: b.title || b.name || `Libro ${b.id || b.volumeId}`,
+      subtitle: b.subtitle || "",
+      editor: b.editor || "",
+    }));
+}
 
 export async function run(options = {}) {
   const argv = yargs(process.argv.slice(2))
@@ -28,6 +343,16 @@ export async function run(options = {}) {
       description: "Token of the user",
       type: "string",
     })
+    .option("username", {
+      alias: "u",
+      description: "HubScuola username (email)",
+      type: "string",
+    })
+    .option("password", {
+      alias: "w",
+      description: "HubScuola password",
+      type: "string",
+    })
     .option("file", {
       alias: "f",
       description: "The output file (defaults to book name)",
@@ -36,6 +361,12 @@ export async function run(options = {}) {
     .option("noCleanUp", {
       alias: "n",
       description: "Don't clean up the temp folder after merging",
+      type: "boolean",
+      default: false
+    })
+    .option("annotations", {
+      alias: "a",
+      description: "Download and draw annotations on the PDF",
       type: "boolean",
       default: false
     })
@@ -60,28 +391,59 @@ export async function run(options = {}) {
       platform = null;
     }
   }
-  platform = platform === "hubyoung" ? "young" : "kids";
+  const normalizedPlatform = normalizePlatform(platform);
 
-  let volumeId = options.volumeId || argv.volumeId;
-  while (!volumeId) volumeId = prompt("Input the volume ID: ");
+  let username = options.username || argv.username;
+  let password = options.password || argv.password;
 
   let token = options.token || argv.token;
-  while (!token) token = prompt("Input the token: ");
+  if (!token) {
+    while (!username) username = prompt("Input username (email): ");
+    while (!password) password = prompt("Input password: ", { echo: '*' });
+
+    try {
+      const login = await hubInternalLogin({ username, password, platform });
+      token = login.tokenId;
+    } catch (err) {
+      console.error("[HubScuola] login fallito", {
+        platform: normalizedPlatform,
+        username,
+        message: err.message,
+      });
+      throw err;
+    }
+  }
+
+  let volumeId = options.volumeId || argv.volumeId;
+  if (!volumeId) {
+    try {
+      const books = await fetchHubLibrary(token, normalizedPlatform);
+      if (books.length) {
+        console.log("Libri trovati:");
+        console.table(
+          Object.fromEntries(
+            books.map((b) => [b.volumeId, [b.title, b.subtitle, b.editor].filter(Boolean).join(" - ")])
+          )
+        );
+      }
+    } catch (err) {
+      console.warn("Impossibile caricare libreria HubScuola:", err.message);
+    }
+  }
+  while (!volumeId) volumeId = prompt("Input the volume ID: ");
 
   console.log("Fetching book info...");
 
   let title;
 
-  let response = await fetch("https://ms-api.hubscuola.it/me" + platform + "/publication/" + volumeId, { 
+  let response = await fetch("https://ms-api.hubscuola.it/me" + normalizedPlatform + "/publication/" + volumeId, { 
     method: "GET", 
     headers: { "Token-Session": token, "Content-Type": "application/json" } 
   });
   const code = response.status;
-  if (code === 500) {
-    console.log("Volume ID not valid");
-    return;
-  } else if (code === 401) {
-    console.log("Token Session not valid, you may have copied it wrong or you don't own this book.");
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    console.log(`Failed fetching book info (status ${code})`, { platform: normalizedPlatform, volumeId, bodyPreview: preview(body) });
     return;
   } else {
     let result = await response.json();
@@ -96,7 +458,8 @@ export async function run(options = {}) {
     { headers: { "Token-Session": token } }
   );
   if (res.status !== 200) {
-    console.error("API error:", res.status);
+    const body = await res.text().catch(() => "");
+    console.error("API error:", res.status, { volumeId, bodyPreview: preview(body) });
     return;
   }
 
@@ -112,7 +475,13 @@ export async function run(options = {}) {
     { readonly: true }
   );
 
-  let chapters = JSON.parse(db.prepare("SELECT offline_value FROM offline_tbl WHERE offline_path=?").get(`me${platform}/publication/${volumeId}`).offline_value).indexContents.chapters;
+  const dbPath = `me${normalizedPlatform}/publication/${volumeId}`;
+  const row = db.prepare("SELECT offline_value FROM offline_tbl WHERE offline_path=?").get(dbPath);
+  if (!row) {
+    console.error(`Impossibile trovare il libro nel database per il percorso: ${dbPath}`);
+    return;
+  }
+  let chapters = JSON.parse(row.offline_value).indexContents.chapters;
 
   db.close();
 
@@ -144,14 +513,25 @@ export async function run(options = {}) {
   const tempPdfPath = `./temp/${title.replace(/[^a-z0-9]/gi, '_')}_temp.pdf`;
   await merger.save(tempPdfPath);
 
-  console.log("Loading PDF for annotations...");
-  const baseBytes = await fs.readFile(tempPdfPath);
-  const pdfDoc = await PDFDocument.load(baseBytes);
-  const pages = pdfDoc.getPages();
+  const outputDir = process.env.OURBOOKS_OUTPUT_DIR || ".";
+  const baseName = (options.file || argv.file || `${title.replace(/[^a-z0-9]/gi, '_')}.pdf`);
+  const outputPath = path.join(outputDir, baseName);
+  await fsExtra.ensureDir(outputDir);
 
-  console.log("Fetching publication metadata...");
+  const wantAnnotations = options.annotations || argv.annotations;
+
+  if (!wantAnnotations) {
+    console.log("Skipping annotations. Copying PDF...");
+    await fs.copyFile(tempPdfPath, outputPath);
+  } else {
+    console.log("Loading PDF for annotations...");
+    const baseBytes = await fs.readFile(tempPdfPath);
+    const pdfDoc = await PDFDocument.load(baseBytes);
+    const pages = pdfDoc.getPages();
+
+    console.log("Fetching publication metadata...");
   const pubRes = await fetch(
-    `https://ms-api.hubscuola.it/meyoung/publication/${volumeId}`,
+    `https://ms-api.hubscuola.it/me${normalizedPlatform}/publication/${volumeId}`,
     {
       headers: {
         "Token-Session": token,
@@ -180,7 +560,7 @@ export async function run(options = {}) {
   for (const pageId of pagesId) {
     try {
       const pageRes = await fetch(
-        `https://ms-api.hubscuola.it/meyoung/publication/${volumeId}/page/${pageId}`,
+        `https://ms-api.hubscuola.it/me${normalizedPlatform}/publication/${volumeId}/page/${pageId}`,
         {
           headers: {
             "Token-Session": token,
@@ -290,10 +670,6 @@ export async function run(options = {}) {
       const b = parseInt(colorHex.slice(5, 7), 16) / 255;
 
       for (const line of data.lines?.points || []) {
-        if (line.length > 0) {
-          const [rx, ry] = line[0];
-          console.log(`  raw point: (${rx}, ${ry}) -> scaled: (${(rx * scaleX).toFixed(2)}, ${(pdfHeight - ry * scaleY).toFixed(2)}) [pdfHeight=${pdfHeight.toFixed(2)}]`);
-        }
         for (let i = 0; i < line.length - 1; i++) {
           const [x1, y1] = line[i];
           const [x2, y2] = line[i + 1];
@@ -312,13 +688,13 @@ export async function run(options = {}) {
     }
   }
 
-  console.log(`Total annotations applied: ${totalInks}`);
-  console.log("Saving final PDF with annotations...");
-  const finalBytes = await pdfDoc.save();
-  const outputPath = argv.file || `${title}.pdf`;
-  await fs.writeFile(outputPath, finalBytes);
+    console.log(`Total annotations applied: ${totalInks}`);
+    console.log("Saving final PDF with annotations...");
+    const finalBytes = await pdfDoc.save();
+    await fs.writeFile(outputPath, finalBytes);
+  }
 
   if (!argv.noCleanUp) fsExtra.removeSync("temp");
 
-  console.log("Book saved:", outputPath);
+  console.log(`OURBOOKS_OUTPUT: ${outputPath}`);
 }

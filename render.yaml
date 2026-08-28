@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: ourbooks
+    runtime: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /
