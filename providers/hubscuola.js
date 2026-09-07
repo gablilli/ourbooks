@@ -489,11 +489,45 @@ export async function run(options = {}) {
 
   for (const chapter of chapters) {
     const url = `https://ms-mms.hubscuola.it/public/${volumeId}/${chapter.chapterId}.zip?tokenId=${token}&app=v2`;
-    var res = await fetch(url, {
-      headers: { "Token-Session": token },
-    }).then((res) => res.arrayBuffer());
-    const zip = new AdmZip(Buffer.from(res));
-    await zip.extractAllTo(`temp/build`);
+    const chapterRes = await fetch(url, {
+      headers: {
+        "Token-Session": token,
+        "Accept": "application/zip, application/octet-stream, */*",
+      },
+    });
+    
+    const buffer = Buffer.from(await chapterRes.arrayBuffer());
+    
+    console.log("Chapter response:", {
+      chapterId: chapter.chapterId,
+      status: chapterRes.status,
+      contentType: chapterRes.headers.get("content-type"),
+      size: buffer.length,
+      signature: buffer.subarray(0, 4).toString("hex"),
+    });
+    
+    if (!chapterRes.ok) {
+      throw new Error(
+        `Errore download capitolo ${chapter.chapterId}: ` +
+        `${chapterRes.status} ${chapterRes.statusText}\n` +
+        preview(buffer.toString("utf8"), 500)
+      );
+    }
+    
+    const signature = buffer.subarray(0, 4).toString("hex");
+    
+    if (!["504b0304", "504b0506", "504b0708"].includes(signature)) {
+      throw new Error(
+        `Il capitolo ${chapter.chapterId} non è uno ZIP valido. ` +
+        `Content-Type=${chapterRes.headers.get("content-type")}, ` +
+        `signature=${signature}, size=${buffer.length}\n` +
+        `Risposta: ${preview(buffer.toString("utf8"), 500)}`
+      );
+    }
+    
+    const zip = new AdmZip(buffer);
+    await zip.extractAllTo("temp/build");
+
   }
 
   console.log("Merging pages...");
