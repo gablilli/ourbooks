@@ -10,20 +10,55 @@ import SVGtoPDF from 'svg-to-pdfkit';
 import { PDFDocument as PDFLibDocument } from 'pdf-lib';
 import { loginSanoma, getBookCatalog, fetchBookAccess } from './src/sanoma/auth.js';
 
-const DATA_KEY = '1cff42dabb60beaf1e3b57988af787246c63613ef60435a05c9c79b98a9b41c8';
+const DATA_KEY =
+  '1cff42dabb60beaf1e3b57988af787246c63613ef60435a05c9c79b98a9b41c8';
 
 function decryptLm60(body) {
-  const decoded = Buffer.from(body, 'base64').toString('utf8');
-  const unescaped = decoded.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+  const base64 = body.replace(/[^A-Za-z0-9+/=]/g, '');
+
+  let decoded = '';
+  const chars =
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+
+  let i = 0;
+
+  while (i < base64.length) {
+    const l = chars.indexOf(base64.charAt(i++));
+    const f = chars.indexOf(base64.charAt(i++));
+    const p = chars.indexOf(base64.charAt(i++));
+    const w = chars.indexOf(base64.charAt(i++));
+
+    const o = (l << 2) | (f >> 4);
+    const s = ((f & 15) << 4) | (p >> 2);
+    const a = ((p & 3) << 6) | w;
+
+    decoded += String.fromCharCode(o);
+
+    if (p !== 64) {
+      decoded += String.fromCharCode(s);
+    }
+
+    if (w !== 64) {
+      decoded += String.fromCharCode(a);
+    }
+  }
+
+  // Identico al viewer LM60:
+  decoded = unescape(decoded);
 
   let result = '';
 
-  for (let i = 0; i < unescaped.length; i++) {
-    const value = unescaped.charCodeAt(i);
-    const keyIndex = (i % DATA_KEY.length) - 1;
-    const key = DATA_KEY.charCodeAt(keyIndex < 0 ? DATA_KEY.length - 1 : keyIndex);
+  for (let i = 0; i < decoded.length; i++) {
+    const value = decoded.charCodeAt(i);
 
-    result += String.fromCharCode(value - key);
+    const keyChar = DATA_KEY.substr(
+      (i % DATA_KEY.length) - 1,
+      1
+    );
+
+    result += String.fromCharCode(
+      value - keyChar.charCodeAt(0)
+    );
   }
 
   return result;
@@ -77,77 +112,344 @@ function parsePageSize(html) {
 }
 
 function parseStyles(html) {
-  const styleMatch = html.match(/<style[^>]*>([\s\S]*?)<\/style>/i);
-  const css = styleMatch ? styleMatch[1] : '';
   const styles = {};
+  const fontFaces = {};
 
-  for (const match of css.matchAll(/\.([a-zA-Z0-9_-]+)\s*\{([^}]*)\}/g)) {
-    const name = match[1];
-    const body = match[2];
+  const styleBlocks = [
+    ...html.matchAll(
+      /<style[^>]*>([\s\S]*?)<\/style>/gi
+    )
+  ].map(m => m[1]);
 
-    const left = body.match(/left:\s*([-\d.]+)px/);
-    const bottom = body.match(/bottom:\s*([-\d.]+)px/);
-    const top = body.match(/top:\s*([-\d.]+)px/);
-    const fontSize = body.match(/font-size:\s*([\d.]+)px/);
-    const letterSpacing = body.match(/letter-spacing:\s*([-\d.]+)px/);
-    const lineHeight = body.match(/line-height:\s*([\d.]+)px/);
+  const css = styleBlocks.join('\n');
 
-    styles[name] = {
-      left: left ? parseFloat(left[1]) : 0,
-      bottom: bottom ? parseFloat(bottom[1]) : null,
-      top: top ? parseFloat(top[1]) : null,
-      fontSize: fontSize ? parseFloat(fontSize[1]) : 10,
-      letterSpacing: letterSpacing ? parseFloat(letterSpacing[1]) : 0,
-      lineHeight: lineHeight ? parseFloat(lineHeight[1]) : null
-    };
+  console.log('CSS LEN:', css.length);
+  console.log('CSS START:', css.slice(0, 3000));
+
+  /*
+   * legge tutti i @font-face dichiarati dal reader.
+   *
+   * Esempio:
+   *
+   * @font-face {
+   *   font-family: NeoSansPro-Bold_b;
+   *   src: url("#PATH#fonts/NeoSansPro-Bold_b.woff") format("woff");
+   * }
+   */
+  for (const match of css.matchAll(
+    /@font-face\s*\{([\s\S]*?)\}/gi
+  )) {
+    const body = match[1];
+
+    const familyMatch = body.match(
+      /font-family\s*:\s*['"]?([^;'"]+)['"]?\s*;/i
+    );
+
+    const srcMatch = body.match(
+      /src\s*:\s*[^;]*url\(\s*['"]?([^'")]+)['"]?\s*\)/i
+    );
+
+    if (!familyMatch || !srcMatch) continue;
+
+    const family = familyMatch[1].trim();
+    const src = srcMatch[1].trim();
+
+    fontFaces[family] = src;
   }
+
+  console.log(
+    'FONT FACES:',
+    Object.entries(fontFaces)
+  );
+
+  /*
+   * parsing delle normali regole CSS.
+   */
+  for (const rule of css.matchAll(
+    /([^{}]+)\{([^{}]*)\}/g
+  )) {
+    const selectorText = rule[1].trim();
+
+    /*
+     * @font-face è già stato elaborato sopra.
+     */
+    if (
+      selectorText
+        .toLowerCase()
+        .includes('@font-face')
+    ) {
+      continue;
+    }
+
+    const selectors = selectorText
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    const body = rule[2];
+
+    const getPx = property => {
+      const m = body.match(
+        new RegExp(
+          `${property}\\s*:\\s*(-?[\\d.]+)px`,
+          'i'
+        )
+      );
+
+      return m
+        ? parseFloat(m[1])
+        : null;
+    };
+
+    const getValue = property => {
+      const m = body.match(
+        new RegExp(
+          `${property}\\s*:\\s*([^;]+)`,
+          'i'
+        )
+      );
+
+      return m
+        ? m[1].trim()
+        : null;
+    };
+
+    const getScaleX = () => {
+      const m = body.match(
+        /transform\s*:\s*[^;]*scaleX\(\s*([\d.]+)\s*\)/i
+      );
+
+      return m
+        ? parseFloat(m[1])
+        : null;
+    };
+
+    let fontFamily = getValue('font-family');
+
+    if (fontFamily) {
+      fontFamily = fontFamily
+        .replace(/^['"]|['"]$/g, '')
+        .trim();
+    }
+
+    const style = {
+      left: getPx('left'),
+      bottom: getPx('bottom'),
+      top: getPx('top'),
+      fontSize: getPx('font-size'),
+      letterSpacing: getPx('letter-spacing'),
+      wordSpacing: getPx('word-spacing'),
+      lineHeight: getPx('line-height'),
+      scaleX: getScaleX(),
+      fontFamily,
+      fontUrl:
+        fontFamily && fontFaces[fontFamily]
+          ? fontFaces[fontFamily]
+          : null
+    };
+
+    const cleanStyle = Object.fromEntries(
+      Object.entries(style).filter(
+        ([, value]) =>
+          value !== null &&
+          value !== undefined &&
+          value !== ''
+      )
+    );
+
+    for (const selector of selectors) {
+      const idMatches = selector.match(
+        /#([a-zA-Z0-9_-]+)/g
+      );
+
+      if (idMatches) {
+        for (const rawId of idMatches) {
+          const id = rawId.slice(1);
+
+          styles[id] = {
+            ...(styles[id] || {}),
+            ...cleanStyle
+          };
+        }
+      }
+
+      const classMatches = selector.match(
+        /\.([a-zA-Z0-9_-]+)/g
+      );
+
+      if (classMatches) {
+        for (const rawClass of classMatches) {
+          const className = rawClass.slice(1);
+
+          styles[className] = {
+            ...(styles[className] || {}),
+            ...cleanStyle
+          };
+        }
+      }
+    }
+  }
+
+  console.log(
+    'STYLE SAMPLE:',
+    Object.entries(styles).slice(0, 20)
+  );
 
   return styles;
 }
 
 function decodeHtml(text) {
   return text
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#([0-9]+);/g, (_, code) => String.fromCodePoint(parseInt(code, 10)));
+    .replace(
+      /<br\s*\/?>/gi,
+      '\n'
+    )
+    .replace(
+      /<[^>]+>/g,
+      ''
+    )
+    .replace(
+      /&nbsp;/gi,
+      ' '
+    )
+    .replace(
+      /&amp;/gi,
+      '&'
+    )
+    .replace(
+      /&lt;/gi,
+      '<'
+    )
+    .replace(
+      /&gt;/gi,
+      '>'
+    )
+    .replace(
+      /&quot;/gi,
+      '"'
+    )
+    .replace(
+      /&#39;/gi,
+      "'"
+    )
+    .replace(
+      /&#x([0-9a-f]+);/gi,
+      (_, hex) =>
+        String.fromCodePoint(
+          parseInt(hex, 16)
+        )
+    )
+    .replace(
+      /&#([0-9]+);/g,
+      (_, code) =>
+        String.fromCodePoint(
+          parseInt(code, 10)
+        )
+    );
 }
 
 function parseSpans(html) {
   const styles = parseStyles(html);
   const spans = [];
 
-  for (const match of html.matchAll(/<span\b([^>]*)>([\s\S]*?)<\/span>/gi)) {
+  const spanRe =
+    /<span\b([^>]*)>([\s\S]*?)<\/span>/gi;
+
+  let match;
+
+  while ((match = spanRe.exec(html)) !== null) {
     const attrs = match[1];
-    const text = decodeHtml(match[2]);
+    const rawText = match[2];
 
-    if (!text.trim()) continue;
+    const id =
+      attrs.match(/\bid="([^"]+)"/i)?.[1] || null;
 
-    const classMatch = attrs.match(/class=["']([^"']+)["']/i);
+    const classes =
+      attrs
+        .match(/\bclass="([^"]+)"/i)?.[1]
+        ?.split(/\s+/)
+        .filter(Boolean) || [];
 
-    if (!classMatch) continue;
+    const style = {
+      ...(id && styles[id]
+        ? styles[id]
+        : {})
+    };
 
-    const classes = classMatch[1].split(/\s+/);
-    const styleName = classes.find(name => styles[name]);
+    /*
+     * applica gli stili delle classi nell'ordine
+     * in cui compaiono nell'attributo class.
+     */
+    for (const className of classes) {
+      const classStyle =
+        styles[className];
 
-    if (!styleName) continue;
+      if (!classStyle) continue;
 
-    const style = styles[styleName];
+      for (const [key, value] of Object.entries(
+        classStyle
+      )) {
+        if (
+          value !== null &&
+          value !== undefined
+        ) {
+          style[key] = value;
+        }
+      }
+    }
+
+    const text = decodeHtml(rawText);
+
+    if (!text) continue;
 
     spans.push({
       text,
-      left: style.left,
-      bottom: style.bottom,
-      top: style.top,
-      fontSize: style.fontSize,
-      letterSpacing: style.letterSpacing,
-      lineHeight: style.lineHeight
+
+      left: Number.isFinite(style.left)
+        ? style.left
+        : 0,
+
+      bottom: Number.isFinite(style.bottom)
+        ? style.bottom
+        : null,
+
+      top: Number.isFinite(style.top)
+        ? style.top
+        : null,
+
+      fontSize: Number.isFinite(style.fontSize)
+        ? style.fontSize
+        : 10,
+
+      letterSpacing:
+        Number.isFinite(style.letterSpacing)
+          ? style.letterSpacing
+          : 0,
+
+      wordSpacing:
+        Number.isFinite(style.wordSpacing)
+          ? style.wordSpacing
+          : 0,
+
+      lineHeight:
+        Number.isFinite(style.lineHeight)
+          ? style.lineHeight
+          : null,
+
+      scaleX:
+        Number.isFinite(style.scaleX)
+          ? style.scaleX
+          : 1,
+
+      fontFamily:
+        typeof style.fontFamily === 'string'
+          ? style.fontFamily
+          : null,
+
+      fontUrl:
+        typeof style.fontUrl === 'string'
+          ? style.fontUrl
+          : null
     });
   }
 
@@ -229,14 +531,47 @@ function resolveAssetUrl(url, pageBaseUrl) {
 }
 
 async function fetchPageData(baseUrl, pageNumber, headers) {
+
   const url = `${baseUrl}/pages/${pageNumber}.data`;
+
   const response = await fetch(url, { headers });
 
   if (!response.ok) {
     throw new Error(`Page ${pageNumber} .data: HTTP ${response.status}`);
   }
 
-  return decryptLm60(await response.text());
+  const raw = await response.text();
+  console.log(
+    `Page ${pageNumber}: raw base64 len=${raw.length}`
+  );
+
+  const decoded = decryptLm60(raw);
+
+  console.log(
+    `Page ${pageNumber}: decoded len=${decoded.length}`
+  );
+
+  const firstSpan = decoded.indexOf("<span");
+  const firstBroken = decoded.search(/[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]/);
+
+  console.log(
+    `Page ${pageNumber}: len=${decoded.length}, ` +
+    `<span=${firstSpan}, firstBroken=${firstBroken}`
+  );
+
+  if (firstSpan >= 0) {
+    console.log(
+      `Page ${pageNumber}:`,
+      decoded.slice(firstSpan, firstSpan + 500)
+    );
+  }
+
+  const spans =
+    decoded.match(/<span\b[^>]*>[\s\S]*?<\/span>/gi) || [];
+
+  console.log(`Page ${pageNumber}: spans=${spans.length}`);
+
+  return decoded;
 }
 
 async function fetchPageSvg(baseUrl, pageNumber, headers) {
@@ -280,46 +615,186 @@ async function prepareSvg(svg, pageBaseUrl, headers) {
   return replaceSvgImages(svg, replacements);
 }
 
-function addSelectableText(doc, page, spans) {
-  if (!spans.length) return;
-
-  doc.save();
-
-  if (typeof doc.opacity === 'function') {
-    doc.opacity(0);
+async function loadFontForSpan(
+  span,
+  pageBaseUrl,
+  headers,
+  fontCache
+) {
+  if (!span.fontFamily || !span.fontUrl) {
+    return null;
   }
 
-  for (const span of spans) {
-    let y;
+  if (fontCache.has(span.fontFamily)) {
+    return fontCache.get(span.fontFamily);
+  }
 
-    if (span.bottom !== null && Number.isFinite(span.bottom)) {
-      y = page.height - span.bottom - span.fontSize;
-    } else if (span.top !== null && Number.isFinite(span.top)) {
-      y = span.top;
-    } else {
-      y = 0;
+  let fontUrl = span.fontUrl;
+
+  if (fontUrl.includes('#PATH#')) {
+    fontUrl = fontUrl.replace(
+      '#PATH#',
+      `${pageBaseUrl}/pages/`
+    );
+  } else {
+    fontUrl = resolveAssetUrl(
+      fontUrl,
+      `${pageBaseUrl}/pages/`
+    );
+  }
+
+  console.log(
+    `Downloading font ${span.fontFamily}: ${fontUrl}`
+  );
+
+  const response = await fetch(fontUrl, {
+    headers: {
+      ...headers,
+      'Accept':
+        'application/font-woff2;q=1.0,application/font-woff;q=0.9,*/*;q=0.8',
+      'Sec-Fetch-Dest':
+        'font'
     }
+  });
+
+  if (!response.ok) {
+    console.warn(
+      `Warning: font unavailable: ${fontUrl} HTTP ${response.status}`
+    );
+
+    fontCache.set(
+      span.fontFamily,
+      null
+    );
+
+    return null;
+  }
+
+  const buffer = Buffer.from(
+    await response.arrayBuffer()
+  );
+
+  fontCache.set(
+    span.fontFamily,
+    buffer
+  );
+
+  return buffer;
+}
+
+function addSelectableText(
+  doc,
+  page,
+  spans,
+  fonts
+) {
+  if (!spans.length) return;
+
+  const SOURCE_WIDTH = 909;
+  const SOURCE_HEIGHT = 1242;
+
+  const scaleX =
+    page.width / SOURCE_WIDTH;
+
+  const scaleY =
+    page.height / SOURCE_HEIGHT;
+
+  console.log(
+    'PRIMI SPAN:',
+    spans.slice(0, 5)
+  );
+
+  for (const span of spans) {
+    const x =
+      span.left * scaleX;
+
+    const y =
+      span.bottom !== null &&
+      Number.isFinite(span.bottom)
+        ? (
+            page.height -
+            span.bottom -
+            span.fontSize
+          ) * scaleY
+        : Number.isFinite(span.top)
+          ? span.top * scaleY
+          : 0;
+
+    const fontSize =
+      span.fontSize * scaleY;
 
     const options = {
       lineBreak: false,
       continued: false
     };
 
-    if (span.letterSpacing) {
-      options.characterSpacing = span.letterSpacing;
+    if (
+      span.letterSpacing &&
+      Number.isFinite(
+        span.letterSpacing
+      )
+    ) {
+      options.characterSpacing =
+        span.letterSpacing;
+    }
+
+    if (
+      span.wordSpacing &&
+      Number.isFinite(
+        span.wordSpacing
+      )
+    ) {
+      options.wordSpacing =
+        span.wordSpacing;
+    }
+
+    /*
+    if (
+      span.scaleX &&
+      Number.isFinite(span.scaleX) &&
+      span.scaleX !== 1
+    ) {
+      options.horizontalScaling =
+        span.scaleX * 100;
+    }
+    */
+
+    const fontBuffer =
+      span.fontFamily
+        ? fonts[span.fontFamily]
+        : null;
+
+    /*
+     * Usa il font originale del libro
+     * quando è disponibile.
+     *
+     * passa a Helvetica soltanto
+     * se il font non è disponibile.
+     */
+    console.log(
+      'FONT CHECK:',
+      span.fontFamily,
+      Buffer.isBuffer(fontBuffer),
+      fontBuffer?.subarray(0, 4).toString('ascii')
+    );
+    if (fontBuffer) {
+      doc.font(
+        fontBuffer
+      );
+    } else {
+      doc.font('Helvetica');
     }
 
     doc
-      .font('Helvetica')
-      .fontSize(span.fontSize)
-      .text(span.text, span.left, y, options);
+      .fontSize(fontSize)
+      .fillOpacity(0)
+      .text(
+        span.text,
+        x,
+        y,
+        options
+      );
   }
-
-  if (typeof doc.opacity === 'function') {
-    doc.opacity(1);
-  }
-
-  doc.restore();
 }
 
 function logMemory(prefix) {
@@ -336,7 +811,7 @@ function forceGc() {
   }
 }
 
-async function renderPage(doc, page, pageIndex, totalPages, headers) {
+async function renderPage(doc, page, pageIndex, totalPages, headers, fonts) {
   const started = Date.now();
 
   console.log(
@@ -376,7 +851,8 @@ async function renderPage(doc, page, pageIndex, totalPages, headers) {
   addSelectableText(
     doc,
     { width, height },
-    page.spans
+    page.spans,
+    fonts
   );
 
   svg = null;
@@ -393,7 +869,7 @@ async function renderPage(doc, page, pageIndex, totalPages, headers) {
   logMemory('Memory');
 }
 
-async function renderPageWorker(page, pageIndex, totalPages, headers, outputPath) {
+async function renderPageWorker(page, pageIndex, totalPages, headers, outputPath, fonts) {
   const doc = new PDFDocument({
     autoFirstPage: false,
     margin: 0,
@@ -427,7 +903,8 @@ async function renderPageWorker(page, pageIndex, totalPages, headers, outputPath
       page,
       pageIndex,
       totalPages,
-      headers
+      headers,
+      fonts
     )
       .then(() => {
         doc.end();
@@ -456,7 +933,8 @@ async function runPageWorker() {
       message.pageIndex,
       message.totalPages,
       message.headers,
-      message.outputPath
+      message.outputPath,
+      message.fonts
     );
 
     if (typeof process.send === 'function') {
@@ -479,7 +957,7 @@ async function runPageWorker() {
   }
 }
 
-function runPageInProcess(page, pageIndex, totalPages, headers, outputPath) {
+function runPageInProcess(page, pageIndex, totalPages, headers, outputPath, fonts) {
   return new Promise((resolve, reject) => {
     const workerPath = fileURLToPath(
       new URL('./sanoma.js', import.meta.url)
@@ -493,6 +971,7 @@ function runPageInProcess(page, pageIndex, totalPages, headers, outputPath) {
           ...process.env,
           OURBOOKS_SANOMA_PAGE_WORKER: '1'
         },
+        serialization: 'advanced',
         stdio: ['ignore', 'inherit', 'inherit', 'ipc']
       }
     );
@@ -548,7 +1027,8 @@ function runPageInProcess(page, pageIndex, totalPages, headers, outputPath) {
       pageIndex,
       totalPages,
       headers,
-      outputPath
+      outputPath,
+      fonts
     });
   });
 }
@@ -583,6 +1063,7 @@ async function createPdf(pdfPath, pages, headers) {
   );
 
   const pageFiles = [];
+  const fontCache = new Map();
 
   try {
     for (let index = 0; index < pages.length; index++) {
@@ -599,6 +1080,36 @@ async function createPdf(pdfPath, pages, headers) {
       );
 
       const spans = parseSpans(html);
+
+      const fonts = {};
+      for (const span of spans) {
+        if (
+          !span.fontFamily ||
+          !span.fontUrl
+        ) {
+          continue;
+        }
+
+        if (
+          Object.prototype.hasOwnProperty.call(
+            fonts,
+            span.fontFamily
+          )
+        ) {
+          continue;
+        }
+
+        const fontBuffer =
+          await loadFontForSpan(
+            span,
+            pageBaseUrl,
+            headers,
+            fontCache
+          );
+
+        fonts[span.fontFamily] =
+          fontBuffer;
+      }
       const size = parsePageSize(html);
 
       console.log(
@@ -621,7 +1132,8 @@ async function createPdf(pdfPath, pages, headers) {
         index + 1,
         pages.length,
         headers,
-        pageFile
+        pageFile,
+        fonts
       );
 
       pageFiles.push(pageFile);
@@ -753,10 +1265,29 @@ export async function run(options = {}) {
     const baseUrl = bookAccess.baseUrl;
 
     const headers = {
-      'Accept': 'application/json, text/plain, */*',
-      'Cookie': bookAccess.cookieHeader,
+      'Accept':
+        'application/json, text/plain, */*',
+      'Accept-Language':
+        'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding':
+        'identity',
+      'Cookie':
+        bookAccess.cookieHeader,
+      'Referer':
+        'https://npmitaly-pro-apidistribucion.sanoma.it/viewers/lm60/online/index.html',
+      'Origin':
+        'https://npmitaly-pro-apidistribucion.sanoma.it',
       'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:154.0) ' +
+        'Gecko/20100101 Firefox/154.0',
+      'Sec-Fetch-Dest':
+        'empty',
+      'Sec-Fetch-Mode':
+        'cors',
+      'Sec-Fetch-Site':
+        'same-origin',
+      'Sec-GPC':
+        '1'
     };
 
     const masterUrl =
