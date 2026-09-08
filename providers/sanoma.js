@@ -2,8 +2,12 @@ import yargs from 'yargs';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import { fork } from 'child_process';
+import { fileURLToPath } from 'url';
 import PDFDocument from 'pdfkit';
 import SVGtoPDF from 'svg-to-pdfkit';
+import { PDFDocument as PDFLibDocument } from 'pdf-lib';
 import { loginSanoma, getBookCatalog, fetchBookAccess } from './src/sanoma/auth.js';
 
 const DATA_KEY = '1cff42dabb60beaf1e3b57988af787246c63613ef60435a05c9c79b98a9b41c8';
@@ -389,21 +393,20 @@ async function renderPage(doc, page, pageIndex, totalPages, headers) {
   logMemory('Memory');
 }
 
-function createPdf(pdfPath, pages, headers) {
-  return new Promise(async (resolve, reject) => {
-    const doc = new PDFDocument({
-      autoFirstPage: false,
-      margin: 0,
-      compress: true
-    });
+async function renderPageWorker(page, pageIndex, totalPages, headers, outputPath) {
+  const doc = new PDFDocument({
+    autoFirstPage: false,
+    margin: 0,
+    compress: true
+  });
 
-    const writeStream = fs.createWriteStream(pdfPath);
+  const writeStream = fs.createWriteStream(outputPath);
 
+  await new Promise((resolve, reject) => {
     let settled = false;
 
-    const fail = (error) => {
+    const fail = error => {
       if (settled) return;
-
       settled = true;
       reject(error);
     };
@@ -412,7 +415,6 @@ function createPdf(pdfPath, pages, headers) {
 
     writeStream.on('finish', () => {
       if (settled) return;
-
       settled = true;
       resolve();
     });
@@ -420,53 +422,230 @@ function createPdf(pdfPath, pages, headers) {
     doc.on('error', fail);
     doc.pipe(writeStream);
 
-    try {
-      for (let index = 0; index < pages.length; index++) {
-        const pageNumber = pages[index];
+    renderPage(
+      doc,
+      page,
+      pageIndex,
+      totalPages,
+      headers
+    )
+      .then(() => {
+        doc.end();
+      })
+      .catch(error => {
+        try {
+          doc.end();
+        } catch {}
 
-        console.log(`Fetching page ${pageNumber}...`);
+        fail(error);
+      });
+  });
+}
 
-        const pageBaseUrl = `${pages[index].baseUrl}`;
+async function runPageWorker() {
+  const message = await new Promise((resolve, reject) => {
+    process.once('message', resolve);
+    process.once('disconnect', () => {
+      reject(new Error('Worker disconnected'));
+    });
+  });
 
-        const html = await fetchPageData(
-          pageBaseUrl,
-          pageNumber,
-          headers
+  try {
+    await renderPageWorker(
+      message.page,
+      message.pageIndex,
+      message.totalPages,
+      message.headers,
+      message.outputPath
+    );
+
+    if (typeof process.send === 'function') {
+      process.send({
+        ok: true,
+        pageNumber: message.page.pageNumber
+      });
+    }
+
+    process.exit(0);
+  } catch (error) {
+    if (typeof process.send === 'function') {
+      process.send({
+        ok: false,
+        error: error.message
+      });
+    }
+
+    process.exit(1);
+  }
+}
+
+function runPageInProcess(page, pageIndex, totalPages, headers, outputPath) {
+  return new Promise((resolve, reject) => {
+    const workerPath = fileURLToPath(
+      new URL('./sanoma.js', import.meta.url)
+    );
+
+    const child = fork(
+      workerPath,
+      [],
+      {
+        env: {
+          ...process.env,
+          OURBOOKS_SANOMA_PAGE_WORKER: '1'
+        },
+        stdio: ['ignore', 'inherit', 'inherit', 'ipc']
+      }
+    );
+
+    let settled = false;
+
+    const finish = (error = null) => {
+      if (settled) return;
+
+      settled = true;
+
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+
+    child.on('message', message => {
+      if (!message?.ok) {
+        finish(
+          new Error(
+            message?.error ||
+            `Worker failed for page ${page.pageNumber}`
+          )
         );
-
-        const spans = parseSpans(html);
-        const size = parsePageSize(html);
-
-        console.log(
-          `Page ${pageNumber}: ${spans.length} text spans`
-        );
-
-        await renderPage(
-          doc,
-          {
-            pageNumber,
-            width: size.width,
-            height: size.height,
-            spans,
-            baseUrl: pageBaseUrl
-          },
-          index + 1,
-          pages.length,
-          headers
-        );
-
-        forceGc();
+        return;
       }
 
-      doc.end();
-    } catch (error) {
-      try {
-        doc.end();
-      } catch {}
+      finish();
+    });
 
-      fail(error);
-    }
+    child.on('error', error => {
+      finish(error);
+    });
+
+    child.on('exit', code => {
+      if (settled) return;
+
+      if (code === 0) {
+        finish();
+      } else {
+        finish(
+          new Error(
+            `Worker for page ${page.pageNumber} exited with code ${code}`
+          )
+        );
+      }
+    });
+
+    child.send({
+      page,
+      pageIndex,
+      totalPages,
+      headers,
+      outputPath
+    });
   });
+}
+
+async function mergePdfPages(pageFiles, outputPath) {
+  const mergedPdf = await PDFLibDocument.create();
+
+  for (const pageFile of pageFiles) {
+    const bytes = await fs.promises.readFile(pageFile);
+    const sourcePdf = await PDFLibDocument.load(bytes);
+    const copiedPages = await mergedPdf.copyPages(
+      sourcePdf,
+      sourcePdf.getPageIndices()
+    );
+
+    for (const page of copiedPages) {
+      mergedPdf.addPage(page);
+    }
+  }
+
+  const outputBytes = await mergedPdf.save();
+
+  await fs.promises.writeFile(
+    outputPath,
+    outputBytes
+  );
+}
+
+async function createPdf(pdfPath, pages, headers) {
+  const tempDir = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), 'ourbooks-sanoma-')
+  );
+
+  const pageFiles = [];
+
+  try {
+    for (let index = 0; index < pages.length; index++) {
+      const page = pages[index];
+      const pageNumber = page.pageNumber;
+      const pageBaseUrl = page.baseUrl;
+
+      console.log(`Fetching page ${pageNumber}...`);
+
+      const html = await fetchPageData(
+        pageBaseUrl,
+        pageNumber,
+        headers
+      );
+
+      const spans = parseSpans(html);
+      const size = parsePageSize(html);
+
+      console.log(
+        `Page ${pageNumber}: ${spans.length} text spans`
+      );
+
+      const pageFile = path.join(
+        tempDir,
+        `${String(index).padStart(5, '0')}.pdf`
+      );
+
+      await runPageInProcess(
+        {
+          pageNumber,
+          width: size.width,
+          height: size.height,
+          spans,
+          baseUrl: pageBaseUrl
+        },
+        index + 1,
+        pages.length,
+        headers,
+        pageFile
+      );
+
+      pageFiles.push(pageFile);
+
+      forceGc();
+      logMemory('Main process memory');
+    }
+
+    console.log('');
+    console.log('Merging rendered pages...');
+
+    await mergePdfPages(
+      pageFiles,
+      pdfPath
+    );
+  } finally {
+    await fs.promises.rm(
+      tempDir,
+      {
+        recursive: true,
+        force: true
+      }
+    ).catch(() => {});
+  }
 }
 
 export async function run(options = {}) {
@@ -730,4 +909,11 @@ export async function getBooks(session) {
       url: product.placeUrl || ''
     }))
   }];
+}
+
+if (
+  process.env.OURBOOKS_SANOMA_PAGE_WORKER ===
+  '1'
+) {
+  runPageWorker();
 }
