@@ -236,7 +236,7 @@ async function fetchPageData(baseUrl, pageNumber, headers) {
 }
 
 async function fetchPageSvg(baseUrl, pageNumber, headers) {
-  const url = `${baseUrl}/pages/${pageNumber}/1.svg`;
+  const url = `${baseUrl}/pages/${pageNumber}/{pageNumber}.svg`;
   const response = await fetch(url, { headers });
 
   if (!response.ok) {
