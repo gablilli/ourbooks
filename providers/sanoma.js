@@ -10,6 +10,7 @@ import SVGtoPDF from 'svg-to-pdfkit';
 import { PDFDocument as PDFLibDocument } from 'pdf-lib';
 import { loginSanoma, getBookCatalog, fetchBookAccess } from './src/sanoma/auth.js';
 
+const DEBUG = process.env.DEBUG === '1';
 const DATA_KEY =
   '1cff42dabb60beaf1e3b57988af787246c63613ef60435a05c9c79b98a9b41c8';
 
@@ -123,9 +124,6 @@ function parseStyles(html) {
 
   const css = styleBlocks.join('\n');
 
-  console.log('CSS LEN:', css.length);
-  console.log('CSS START:', css.slice(0, 3000));
-
   /*
    * legge tutti i @font-face dichiarati dal reader.
    *
@@ -156,11 +154,6 @@ function parseStyles(html) {
 
     fontFaces[family] = src;
   }
-
-  console.log(
-    'FONT FACES:',
-    Object.entries(fontFaces)
-  );
 
   /*
    * parsing delle normali regole CSS.
@@ -289,11 +282,6 @@ function parseStyles(html) {
       }
     }
   }
-
-  console.log(
-    'STYLE SAMPLE:',
-    Object.entries(styles).slice(0, 20)
-  );
 
   return styles;
 }
@@ -541,35 +529,8 @@ async function fetchPageData(baseUrl, pageNumber, headers) {
   }
 
   const raw = await response.text();
-  console.log(
-    `Page ${pageNumber}: raw base64 len=${raw.length}`
-  );
 
   const decoded = decryptLm60(raw);
-
-  console.log(
-    `Page ${pageNumber}: decoded len=${decoded.length}`
-  );
-
-  const firstSpan = decoded.indexOf("<span");
-  const firstBroken = decoded.search(/[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]/);
-
-  console.log(
-    `Page ${pageNumber}: len=${decoded.length}, ` +
-    `<span=${firstSpan}, firstBroken=${firstBroken}`
-  );
-
-  if (firstSpan >= 0) {
-    console.log(
-      `Page ${pageNumber}:`,
-      decoded.slice(firstSpan, firstSpan + 500)
-    );
-  }
-
-  const spans =
-    decoded.match(/<span\b[^>]*>[\s\S]*?<\/span>/gi) || [];
-
-  console.log(`Page ${pageNumber}: spans=${spans.length}`);
 
   return decoded;
 }
@@ -625,10 +586,6 @@ async function loadFontForSpan(
     return null;
   }
 
-  if (fontCache.has(span.fontFamily)) {
-    return fontCache.get(span.fontFamily);
-  }
-
   let fontUrl = span.fontUrl;
 
   if (fontUrl.includes('#PATH#')) {
@@ -643,17 +600,22 @@ async function loadFontForSpan(
     );
   }
 
-  console.log(
-    `Downloading font ${span.fontFamily}: ${fontUrl}`
-  );
+  if (fontCache.has(fontUrl)) {
+    return fontCache.get(fontUrl);
+  }
+
+  if (DEBUG) {
+    console.log(
+      `Downloading font ${span.fontFamily}: ${fontUrl}`
+    );
+  }
 
   const response = await fetch(fontUrl, {
     headers: {
       ...headers,
       'Accept':
         'application/font-woff2;q=1.0,application/font-woff;q=0.9,*/*;q=0.8',
-      'Sec-Fetch-Dest':
-        'font'
+      'Sec-Fetch-Dest': 'font'
     }
   });
 
@@ -662,10 +624,7 @@ async function loadFontForSpan(
       `Warning: font unavailable: ${fontUrl} HTTP ${response.status}`
     );
 
-    fontCache.set(
-      span.fontFamily,
-      null
-    );
+    fontCache.set(fontUrl, null);
 
     return null;
   }
@@ -674,10 +633,7 @@ async function loadFontForSpan(
     await response.arrayBuffer()
   );
 
-  fontCache.set(
-    span.fontFamily,
-    buffer
-  );
+  fontCache.set(fontUrl, buffer);
 
   return buffer;
 }
@@ -699,10 +655,7 @@ function addSelectableText(
   const scaleY =
     page.height / SOURCE_HEIGHT;
 
-  console.log(
-    'PRIMI SPAN:',
-    spans.slice(0, 5)
-  );
+  let currentFont = null;
 
   for (const span of spans) {
     const x =
@@ -764,25 +717,14 @@ function addSelectableText(
         ? fonts[span.fontFamily]
         : null;
 
-    /*
-     * Usa il font originale del libro
-     * quando è disponibile.
-     *
-     * passa a Helvetica soltanto
-     * se il font non è disponibile.
-     */
-    console.log(
-      'FONT CHECK:',
-      span.fontFamily,
-      Buffer.isBuffer(fontBuffer),
-      fontBuffer?.subarray(0, 4).toString('ascii')
-    );
-    if (fontBuffer) {
-      doc.font(
-        fontBuffer
-      );
-    } else {
-      doc.font('Helvetica');
+    if (fontBuffer !== currentFont) {
+      if (fontBuffer) {
+        doc.font(fontBuffer);
+      } else {
+        doc.font('Helvetica');
+      }
+
+      currentFont = fontBuffer;
     }
 
     doc
@@ -798,6 +740,7 @@ function addSelectableText(
 }
 
 function logMemory(prefix) {
+  if (!DEBUG) return;
   const memory = process.memoryUsage();
 
   console.log(
@@ -1062,16 +1005,16 @@ async function createPdf(pdfPath, pages, headers) {
     path.join(os.tmpdir(), 'ourbooks-sanoma-')
   );
 
-  const pageFiles = [];
+  const pageFiles = new Array(pages.length);
   const fontCache = new Map();
 
+  const CONCURRENCY = 4;
+
   try {
-    for (let index = 0; index < pages.length; index++) {
+    async function renderOnePage(index) {
       const page = pages[index];
       const pageNumber = page.pageNumber;
       const pageBaseUrl = page.baseUrl;
-
-      console.log(`Fetching page ${pageNumber}...`);
 
       const html = await fetchPageData(
         pageBaseUrl,
@@ -1080,13 +1023,10 @@ async function createPdf(pdfPath, pages, headers) {
       );
 
       const spans = parseSpans(html);
-
       const fonts = {};
+
       for (const span of spans) {
-        if (
-          !span.fontFamily ||
-          !span.fontUrl
-        ) {
+        if (!span.fontFamily || !span.fontUrl) {
           continue;
         }
 
@@ -1099,22 +1039,17 @@ async function createPdf(pdfPath, pages, headers) {
           continue;
         }
 
-        const fontBuffer =
-          await loadFontForSpan(
-            span,
-            pageBaseUrl,
-            headers,
-            fontCache
-          );
+        const fontBuffer = await loadFontForSpan(
+          span,
+          pageBaseUrl,
+          headers,
+          fontCache
+        );
 
-        fonts[span.fontFamily] =
-          fontBuffer;
+        fonts[span.fontFamily] = fontBuffer;
       }
-      const size = parsePageSize(html);
 
-      console.log(
-        `Page ${pageNumber}: ${spans.length} text spans`
-      );
+      const size = parsePageSize(html);
 
       const pageFile = path.join(
         tempDir,
@@ -1136,19 +1071,39 @@ async function createPdf(pdfPath, pages, headers) {
         fonts
       );
 
-      pageFiles.push(pageFile);
-
-      forceGc();
-      logMemory('Main process memory');
+      pageFiles[index] = pageFile;
     }
 
-    console.log('');
+    for (
+      let start = 0;
+      start < pages.length;
+      start += CONCURRENCY
+    ) {
+      const end = Math.min(
+        start + CONCURRENCY,
+        pages.length
+      );
+
+      const jobs = [];
+
+      for (let index = start; index < end; index++) {
+        jobs.push(renderOnePage(index));
+      }
+
+      await Promise.all(jobs);
+
+      if (DEBUG) {
+        logMemory('Main process memory');
+      }
+    }
+
     console.log('Merging rendered pages...');
 
     await mergePdfPages(
       pageFiles,
       pdfPath
     );
+
   } finally {
     await fs.promises.rm(
       tempDir,
