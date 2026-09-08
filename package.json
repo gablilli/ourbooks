@@ -5,10 +5,10 @@
   "main": "cli.js",
   "scripts": {
     "cli": "node cli.js",
-    "start": "node server.js",
+    "start": "node --expose-gc server.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "hub:docenti": "node hubscuola-docenti.js",
-    "ui": "node server.js"
+    "ui": "node --expose-gc server.js"
   },
   "repository": {
     "type": "git",
