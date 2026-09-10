@@ -1,0 +1,44 @@
+name: sync to huggingface
+on:
+  push:
+    branches:
+      - trunk
+  workflow_dispatch:
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: prepend HF yaml header to README (runner copy only)
+        shell: bash
+        run: |
+          echo '---' | cat - hf_space_metadata.yml > README_hf.md
+          echo -e '---\n' | cat - README.md >> README_hf.md
+          rm README.md
+          mv README_hf.md README.md
+
+      - name: install huggingface cli
+        run: pip install huggingface_hub hf_xet
+
+      - name: push to huggingface space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          python3 << 'PYEOF'
+          import os
+          from huggingface_hub import HfApi
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          api.upload_folder(
+              folder_path=".",
+              repo_id="gablilli/ourbooks",
+              repo_type="space",
+              ignore_patterns=[".git", ".github", "__pycache__", "*.pyc", ".gitattributes", "hf_space_metadata.yml"],
+              commit_message=os.environ.get("COMMIT_MSG", "sync from github")
+          )
+          print("sync completato")
+          PYEOF
