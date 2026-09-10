@@ -10,7 +10,7 @@ import SVGtoPDF from 'svg-to-pdfkit';
 import { PDFDocument as PDFLibDocument } from 'pdf-lib';
 import { loginSanoma, getBookCatalog, fetchBookAccess } from './src/sanoma/auth.js';
 
-const DEBUG = process.env.DEBUG === '1';
+const DEBUG = process.env.DEBUG === 'true';
 const DATA_KEY =
   '1cff42dabb60beaf1e3b57988af787246c63613ef60435a05c9c79b98a9b41c8';
 
@@ -664,11 +664,8 @@ function addSelectableText(
     const y =
       span.bottom !== null &&
       Number.isFinite(span.bottom)
-        ? (
-            page.height -
-            span.bottom -
-            span.fontSize
-          ) * scaleY
+        ? page.height -
+          (span.bottom + span.fontSize) * scaleY
         : Number.isFinite(span.top)
           ? span.top * scaleY
           : 0;
@@ -700,17 +697,6 @@ function addSelectableText(
       options.wordSpacing =
         span.wordSpacing;
     }
-
-    /*
-    if (
-      span.scaleX &&
-      Number.isFinite(span.scaleX) &&
-      span.scaleX !== 1
-    ) {
-      options.horizontalScaling =
-        span.scaleX * 100;
-    }
-    */
 
     const fontBuffer =
       span.fontFamily
@@ -754,7 +740,14 @@ function forceGc() {
   }
 }
 
-async function renderPage(doc, page, pageIndex, totalPages, headers, fonts) {
+async function renderPage(
+  doc,
+  page,
+  pageIndex,
+  totalPages,
+  headers,
+  fonts
+) {
   const started = Date.now();
 
   console.log(
@@ -775,21 +768,68 @@ async function renderPage(doc, page, pageIndex, totalPages, headers, fonts) {
     headers
   );
 
-  const svgSize = getSvgSize(preparedSvg);
+  const width = page.width || 909;
+  const height = page.height || 1242;
 
-  const width = page.width || svgSize.width;
-  const height = page.height || svgSize.height;
+  // Analisi della struttura SVG
+  const svgBytes = Buffer.byteLength(preparedSvg, 'utf8');
+  const svgKb = (svgBytes / 1024).toFixed(1);
+
+  const pathCount =
+    (preparedSvg.match(/<path\b/gi) || []).length;
+
+  const useCount =
+    (preparedSvg.match(/<use\b/gi) || []).length;
+
+  const groupCount =
+    (preparedSvg.match(/<g\b/gi) || []).length;
+
+  const imageCount =
+    (preparedSvg.match(/<image\b/gi) || []).length;
+
+  const clipPathCount =
+    (preparedSvg.match(/<clipPath\b/gi) || []).length;
+
+  console.log(
+    `SVG stats page ${page.pageNumber}: ` +
+    `${svgKb} KB | ` +
+    `path=${pathCount} | ` +
+    `use=${useCount} | ` +
+    `g=${groupCount} | ` +
+    `image=${imageCount} | ` +
+    `clipPath=${clipPathCount}`
+  );
+
+  // Rendering SVG
+  const svgToPdfStarted = Date.now();
 
   doc.addPage({
     size: [width, height],
     margin: 0
   });
 
-  SVGtoPDF(doc, preparedSvg, 0, 0, {
-    width,
-    height,
-    preserveAspectRatio: 'none'
-  });
+  SVGtoPDF(
+    doc,
+    preparedSvg,
+    0,
+    0,
+    {
+      width,
+      height,
+      preserveAspectRatio: 'none',
+      precision: 1
+    }
+  );
+
+  const svgToPdfElapsed =
+    ((Date.now() - svgToPdfStarted) / 1000).toFixed(2);
+
+  console.log(
+    `SVGtoPDF page ${page.pageNumber}: ${svgToPdfElapsed}s`
+  );
+
+  // Testo selezionabile
+  const textStarted = Date.now();
 
   addSelectableText(
     doc,
@@ -798,12 +838,18 @@ async function renderPage(doc, page, pageIndex, totalPages, headers, fonts) {
     fonts
   );
 
+  const textElapsed =
+    ((Date.now() - textStarted) / 1000).toFixed(2);
+
+  console.log(
+    `Text layer page ${page.pageNumber}: ${textElapsed}s`
+  );
+
   svg = null;
   preparedSvg = null;
 
-  forceGc();
-
-  const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+  const elapsed =
+    ((Date.now() - started) / 1000).toFixed(1);
 
   console.log(
     `✓ page ${page.pageNumber} — ${elapsed}s`
@@ -863,117 +909,222 @@ async function renderPageWorker(page, pageIndex, totalPages, headers, outputPath
 }
 
 async function runPageWorker() {
-  const message = await new Promise((resolve, reject) => {
-    process.once('message', resolve);
-    process.once('disconnect', () => {
-      reject(new Error('Worker disconnected'));
+  const queue = [];
+
+  let processing = false;
+
+  async function processMessage(message) {
+    processing = true;
+
+    try {
+      await renderPageWorker(
+        message.page,
+        message.pageIndex,
+        message.totalPages,
+        message.headers,
+        message.outputPath,
+        message.fonts,
+        message.imageBuffer
+      );
+
+      if (typeof process.send === 'function') {
+        process.send({
+          ok: true,
+          pageNumber: message.page.pageNumber
+        });
+      }
+    } catch (error) {
+      if (typeof process.send === 'function') {
+        process.send({
+          ok: false,
+          pageNumber: message.page?.pageNumber,
+          error: error?.message || String(error)
+        });
+      }
+    } finally {
+      processing = false;
+
+      if (queue.length > 0) {
+        const nextMessage = queue.shift();
+
+        await processMessage(nextMessage);
+      }
+    }
+  }
+
+  process.on('message', message => {
+    if (processing) {
+      queue.push(message);
+      return;
+    }
+
+    processMessage(message).catch(error => {
+      if (typeof process.send === 'function') {
+        process.send({
+          ok: false,
+          error: error?.message || String(error)
+        });
+      }
     });
   });
 
-  try {
-    await renderPageWorker(
-      message.page,
-      message.pageIndex,
-      message.totalPages,
-      message.headers,
-      message.outputPath,
-      message.fonts
-    );
-
-    if (typeof process.send === 'function') {
-      process.send({
-        ok: true,
-        pageNumber: message.page.pageNumber
-      });
-    }
-
-    process.exit(0);
-  } catch (error) {
-    if (typeof process.send === 'function') {
-      process.send({
-        ok: false,
-        error: error.message
-      });
-    }
-
-    process.exit(1);
-  }
 }
 
-function runPageInProcess(page, pageIndex, totalPages, headers, outputPath, fonts) {
-  return new Promise((resolve, reject) => {
-    const workerPath = fileURLToPath(
-      new URL('./sanoma.js', import.meta.url)
-    );
+function createWorker() {
+  const workerPath = fileURLToPath(
+    new URL(
+      './sanoma.js',
+      import.meta.url
+    )
+  );
 
-    const child = fork(
-      workerPath,
-      [],
-      {
-        env: {
-          ...process.env,
-          OURBOOKS_SANOMA_PAGE_WORKER: '1'
-        },
-        serialization: 'advanced',
-        stdio: ['ignore', 'inherit', 'inherit', 'ipc']
-      }
-    );
+  const child = fork(
+    workerPath,
+    [],
+    {
+      env: {
+        ...process.env,
 
-    let settled = false;
+        OURBOOKS_SANOMA_PAGE_WORKER:
+          '1'
+      },
 
-    const finish = (error = null) => {
-      if (settled) return;
+      serialization: 'advanced',
 
-      settled = true;
+      stdio: [
+        'ignore',
+        'inherit',
+        'inherit',
+        'ipc'
+      ]
+    }
+  );
 
-      if (error) {
-        reject(error);
-      } else {
-        resolve();
-      }
-    };
+  return child;
+}
 
-    child.on('message', message => {
-      if (!message?.ok) {
+function runPageInProcess(
+  child,
+  page,
+  pageIndex,
+  totalPages,
+  headers,
+  outputPath,
+  fonts,
+  imageBuffer
+) {
+  return new Promise(
+    (resolve, reject) => {
+      let settled = false;
+
+      const cleanup = () => {
+        child.off(
+          'message',
+          onMessage
+        );
+
+        child.off(
+          'error',
+          onError
+        );
+
+        child.off(
+          'exit',
+          onExit
+        );
+      };
+
+      const finish = (
+        error = null
+      ) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+
+        cleanup();
+
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+
+      const onMessage = message => {
+        if (
+          message?.pageNumber !==
+          page.pageNumber
+        ) {
+          return;
+        }
+
+        if (message.ok) {
+          finish();
+        } else {
+          finish(
+            new Error(
+              message.error ||
+              `Page worker failed for page ${page.pageNumber}`
+            )
+          );
+        }
+      };
+
+      const onError = error => {
+        finish(error);
+      };
+
+      const onExit = code => {
+        if (settled) {
+          return;
+        }
+
         finish(
           new Error(
-            message?.error ||
-            `Worker failed for page ${page.pageNumber}`
+            `Page worker exited with code ${code}`
           )
         );
-        return;
-      }
+      };
 
-      finish();
-    });
+      child.on(
+        'message',
+        onMessage
+      );
 
-    child.on('error', error => {
-      finish(error);
-    });
+      child.once(
+        'error',
+        onError
+      );
 
-    child.on('exit', code => {
-      if (settled) return;
+      child.once(
+        'exit',
+        onExit
+      );
 
-      if (code === 0) {
-        finish();
-      } else {
-        finish(
-          new Error(
-            `Worker for page ${page.pageNumber} exited with code ${code}`
-          )
+      try {
+        child.send(
+          {
+            page,
+            pageIndex,
+            totalPages,
+            headers,
+            outputPath,
+            fonts,
+            imageBuffer
+          },
+          error => {
+            if (error) {
+              finish(error);
+            }
+          }
         );
+      } catch (error) {
+        finish(error);
       }
-    });
-
-    child.send({
-      page,
-      pageIndex,
-      totalPages,
-      headers,
-      outputPath,
-      fonts
-    });
-  });
+    }
+  );
 }
 
 async function mergePdfPages(pageFiles, outputPath) {
@@ -1000,33 +1151,81 @@ async function mergePdfPages(pageFiles, outputPath) {
   );
 }
 
-async function createPdf(pdfPath, pages, headers) {
-  const tempDir = await fs.promises.mkdtemp(
-    path.join(os.tmpdir(), 'ourbooks-sanoma-')
-  );
+async function createPdf(
+  pdfPath,
+  pages,
+  headers
+) {
+  const tempDir =
+    await fs.promises.mkdtemp(
+      path.join(
+        os.tmpdir(),
+        'ourbooks-sanoma-'
+      )
+    );
 
-  const pageFiles = new Array(pages.length);
-  const fontCache = new Map();
+  const pageFiles =
+    new Array(pages.length);
 
-  const CONCURRENCY = 4;
+  const fontCache =
+    new Map();
+
+  const CONCURRENCY = 1;
+
+  const workers = [];
 
   try {
-    async function renderOnePage(index) {
-      const page = pages[index];
-      const pageNumber = page.pageNumber;
-      const pageBaseUrl = page.baseUrl;
-
-      const html = await fetchPageData(
-        pageBaseUrl,
-        pageNumber,
-        headers
+    for (
+      let i = 0;
+      i < CONCURRENCY;
+      i++
+    ) {
+      workers.push(
+        createWorker()
       );
+    }
 
-      const spans = parseSpans(html);
+    console.log(
+      `Started ${workers.length} persistent page worker(s).`
+    );
+
+    /*
+     * Renderizza una singola pagina
+     * usando uno specifico worker.
+     */
+    async function renderOnePage(
+      index,
+      worker
+    ) {
+      const page =
+        pages[index];
+
+      const pageNumber =
+        page.pageNumber;
+
+      const pageBaseUrl =
+        page.baseUrl;
+
+      const html =
+        await fetchPageData(
+          pageBaseUrl,
+          pageNumber,
+          headers
+        );
+
+      const spans =
+        parseSpans(html);
+
       const fonts = {};
 
+      /*
+       * Caricamento dei font.
+       */
       for (const span of spans) {
-        if (!span.fontFamily || !span.fontUrl) {
+        if (
+          !span.fontFamily ||
+          !span.fontUrl
+        ) {
           continue;
         }
 
@@ -1039,65 +1238,159 @@ async function createPdf(pdfPath, pages, headers) {
           continue;
         }
 
-        const fontBuffer = await loadFontForSpan(
-          span,
-          pageBaseUrl,
-          headers,
-          fontCache
-        );
+        const fontBuffer =
+          await loadFontForSpan(
+            span,
+            pageBaseUrl,
+            headers,
+            fontCache
+          );
 
-        fonts[span.fontFamily] = fontBuffer;
+        fonts[
+          span.fontFamily
+        ] = fontBuffer;
       }
 
-      const size = parsePageSize(html);
+      const size =
+        parsePageSize(html);
 
-      const pageFile = path.join(
-        tempDir,
-        `${String(index).padStart(5, '0')}.pdf`
-      );
+      const pageFile =
+        path.join(
+          tempDir,
+          `${String(index).padStart(5, '0')}.pdf`
+        );
+
+      /*
+       * Prepariamo l'oggetto pagina
+       * che verrà passato al worker.
+       */
+      const workerPage = {
+        pageNumber,
+        width: size.width,
+        height: size.height,
+        spans,
+        baseUrl: pageBaseUrl
+      };
 
       await runPageInProcess(
-        {
-          pageNumber,
-          width: size.width,
-          height: size.height,
-          spans,
-          baseUrl: pageBaseUrl
-        },
+        worker,
+        workerPage,
         index + 1,
         pages.length,
         headers,
         pageFile,
-        fonts
+        fonts,
+        null
       );
 
-      pageFiles[index] = pageFile;
+      pageFiles[index] =
+        pageFile;
     }
 
-    for (
-      let start = 0;
-      start < pages.length;
-      start += CONCURRENCY
-    ) {
-      const end = Math.min(
-        start + CONCURRENCY,
-        pages.length
-      );
+    /*
+     * Distribuiamo le pagine nel pool.
+     *
+     * Ogni worker lavora su una pagina
+     * alla volta e, appena finisce,
+     * riceve la pagina successiva.
+     */
+    let nextIndex = 0;
 
-      const jobs = [];
+    async function workerLoop(worker) {
+      while (true) {
+        const index =
+          nextIndex++;
 
-      for (let index = start; index < end; index++) {
-        jobs.push(renderOnePage(index));
-      }
+        if (
+          index >= pages.length
+        ) {
+          return;
+        }
 
-      await Promise.all(jobs);
+        await renderOnePage(
+          index,
+          worker
+        );
 
-      if (DEBUG) {
-        logMemory('Main process memory');
+        if (DEBUG) {
+          logMemory(
+            `Main process after page ${pages[index].pageNumber}`
+          );
+        }
       }
     }
 
-    console.log('Merging rendered pages...');
+    /*
+     * Tutti i worker lavorano
+     * contemporaneamente.
+     */
+    await Promise.all(
+      workers.map(
+        worker =>
+          workerLoop(worker)
+      )
+    );
+
+    console.log(
+      'All pages rendered.'
+    );
+
+    /*
+     * Chiudiamo ordinatamente
+     * tutti i worker persistenti.
+     */
+    await Promise.all(
+      workers.map(
+        worker =>
+          new Promise(resolve => {
+            let settled = false;
+
+            const finish = () => {
+              if (settled) {
+                return;
+              }
+
+              settled = true;
+
+              resolve();
+            };
+
+            worker.once(
+              'exit',
+              finish
+            );
+
+            try {
+              worker.disconnect();
+            } catch {
+              finish();
+            }
+
+            /*
+             * Fallback nel caso il processo
+             * non termini dopo disconnect().
+             */
+            setTimeout(
+              () => {
+                if (settled) {
+                  return;
+                }
+
+                try {
+                  worker.kill();
+                } catch {}
+
+                finish();
+              },
+              2000
+            );
+          })
+      )
+    );
+
+    console.log(
+      'Merging rendered pages...'
+    );
 
     await mergePdfPages(
       pageFiles,
@@ -1105,6 +1398,18 @@ async function createPdf(pdfPath, pages, headers) {
     );
 
   } finally {
+    /*
+     * Se qualcosa va storto, assicuriamoci
+     * che nessun worker rimanga vivo.
+     */
+    for (const worker of workers) {
+      try {
+        if (!worker.killed) {
+          worker.kill();
+        }
+      } catch {}
+    }
+
     await fs.promises.rm(
       tempDir,
       {
