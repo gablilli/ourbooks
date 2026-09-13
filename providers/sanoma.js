@@ -1,4 +1,5 @@
 import yargs from 'yargs';
+import inquirer from 'inquirer';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import path from 'path';
@@ -546,34 +547,137 @@ async function fetchPageSvg(baseUrl, pageNumber, headers) {
   return response.text();
 }
 
+function expandSvgUseElements(svg) {
+  const defsMatch = svg.match(/<defs\b[^>]*>([\s\S]*?)<\/defs>/i);
+
+  if (!defsMatch) {
+    return svg;
+  }
+
+  const defs = defsMatch[1];
+  const pathMap = new Map();
+
+  const pathRegex = /<path\b([^>]*?)\bid="([^"]+)"([^>]*?)\/>/gi;
+
+  let match;
+
+  while ((match = pathRegex.exec(defs)) !== null) {
+    const beforeId = match[1];
+    const id = match[2];
+    const afterId = match[3];
+
+    pathMap.set(
+      id,
+      `<path${beforeId}${afterId}/>`
+    );
+  }
+
+  if (!pathMap.size) {
+    return svg;
+  }
+
+  let expanded = 0;
+
+  const result = svg.replace(
+    /<use\b([^>]*?)\/>/gi,
+    (full, attributes) => {
+      const hrefMatch = attributes.match(
+        /(?:xlink:href|href)="([^"]+)"/i
+      );
+
+      if (!hrefMatch) {
+        return full;
+      }
+
+      const href = hrefMatch[1];
+
+      if (!href.startsWith('#')) {
+        return full;
+      }
+
+      const path = pathMap.get(href.slice(1));
+
+      if (!path) {
+        return full;
+      }
+
+      const transformMatch = attributes.match(
+        /\btransform="([^"]*)"/i
+      );
+
+      if (!transformMatch) {
+        expanded++;
+        return `<g>${path}</g>`;
+      }
+
+      expanded++;
+
+      return `<g transform="${transformMatch[1]}">${path}</g>`;
+    }
+  );
+
+  if (expanded === 0) {
+    return svg;
+  }
+
+  return result;
+}
+
 async function prepareSvg(svg, pageBaseUrl, headers) {
+  svg = expandSvgUseElements(svg);
+
   const imageUrls = extractSvgImages(svg);
 
   if (!imageUrls.length) {
     return svg;
   }
 
-  const replacements = [];
-
-  for (const imageUrl of imageUrls) {
-    const absoluteUrl = resolveAssetUrl(imageUrl, pageBaseUrl);
-
-    const response = await fetch(absoluteUrl, { headers });
-
-    if (!response.ok) {
-      console.warn(
-        `Warning: SVG image unavailable: ${absoluteUrl} HTTP ${response.status}`
+  const replacements = await Promise.all(
+    imageUrls.map(async imageUrl => {
+      const absoluteUrl = resolveAssetUrl(
+        imageUrl,
+        pageBaseUrl
       );
-      continue;
-    }
 
-    const buffer = Buffer.from(await response.arrayBuffer());
-    const dataUri = toDataUri(buffer, guessContentType(absoluteUrl));
+      try {
+        const response = await fetch(
+          absoluteUrl,
+          {
+            headers
+          }
+        );
 
-    replacements.push([imageUrl, dataUri]);
-  }
+        if (!response.ok) {
+          console.error(
+            `Immagine SVG ${absoluteUrl}: HTTP ${response.status}`
+          );
+          return null;
+        }
 
-  return replaceSvgImages(svg, replacements);
+        const buffer = Buffer.from(
+          await response.arrayBuffer()
+        );
+
+        return [
+          imageUrl,
+          toDataUri(
+            buffer,
+            guessContentType(absoluteUrl)
+          )
+        ];
+      } catch (error) {
+        console.error(
+          `Errore immagine SVG ${absoluteUrl}: ${error.message}`
+        );
+        return null;
+      }
+    })
+  );
+
+  return replaceSvgImages(
+    svg,
+    replacements.filter(Boolean)
+  );
 }
 
 async function loadFontForSpan(
@@ -972,10 +1076,7 @@ async function runPageWorker() {
 
 function createWorker() {
   const workerPath = fileURLToPath(
-    new URL(
-      './sanoma.js',
-      import.meta.url
-    )
+    new URL('./sanoma.js', import.meta.url)
   );
 
   const child = fork(
@@ -984,21 +1085,26 @@ function createWorker() {
     {
       env: {
         ...process.env,
-
-        OURBOOKS_SANOMA_PAGE_WORKER:
-          '1'
+        OURBOOKS_SANOMA_PAGE_WORKER: '1'
       },
-
       serialization: 'advanced',
-
-      stdio: [
-        'ignore',
-        'inherit',
-        'inherit',
-        'ipc'
-      ]
+      stdio: ['ignore', 'inherit', 'inherit', 'ipc']
     }
   );
+
+  child.on('error', error => {
+    console.error(
+      `Sanoma worker error: ${error.message}`
+    );
+  });
+
+  child.on('exit', (code, signal) => {
+    if (code !== 0) {
+      console.error(
+        `Sanoma worker terminato: code=${code}, signal=${signal || 'none'}`
+      );
+    }
+  });
 
   return child;
 }
@@ -1170,7 +1276,7 @@ async function createPdf(
   const fontCache =
     new Map();
 
-  const CONCURRENCY = 1;
+  const CONCURRENCY = 2;
 
   const workers = [];
 
@@ -1449,262 +1555,248 @@ export async function run(options = {}) {
     .help()
     .argv;
 
-  const { id, password, gedi } = options;
-
   console.log('Avvio provider Sanoma...');
 
   const outputDir = process.env.OURBOOKS_OUTPUT_DIR || '.';
 
-  (async () => {
-    const userId = id || argv.id;
-    const userPassword = password || argv.password;
-    const bookGedi = gedi || argv.gedi;
+  let userId = options.id || argv.id;
+  let userPassword = options.password || argv.password;
+  let bookGedi = options.gedi || argv.gedi;
 
-    if (!userId) {
-      console.error('Errore: parametro --id mancante');
-      process.exit(1);
-    }
+  if (!userId) {
+    const answer = await inquirer.prompt([
+      {
+        type: 'input',
+        name: 'id',
+        message: 'Email Sanoma:'
+      }
+    ]);
+    userId = answer.id;
+  }
 
-    if (!userPassword) {
-      console.error('Errore: parametro --password mancante');
-      process.exit(1);
-    }
+  if (!userPassword) {
+    const answer = await inquirer.prompt([
+      {
+        type: 'password',
+        name: 'password',
+        message: 'Password Sanoma:',
+        mask: '*'
+      }
+    ]);
+    userPassword = answer.password;
+  }
 
-    if (!bookGedi) {
-      console.error('Errore: parametro --gedi mancante');
-      process.exit(1);
-    }
+  console.log('');
 
-    console.log('Warning: this script might log you out of other devices');
+  console.log('Warning: this script might log you out of other devices');
+  console.log('Logging in to MyPlace...');
 
-    console.log('Logging in to MyPlace...');
+  let skClient;
 
-    const skClient = await loginSanoma(userId, userPassword).catch(err => {
-      console.error('Failed to log in:', err.message);
-      process.exit(1);
-    });
+  try {
+    skClient = await loginSanoma(userId, userPassword);
+  } catch (err) {
+    throw new Error(`Failed to log in: ${err.message}`);
+  }
 
-    console.log('Fetching book list...');
+  console.log('Login effettuato.');
+  console.log('Fetching book list...');
 
-    const catalog = await getBookCatalog(skClient);
+  const catalog = await getBookCatalog(skClient);
 
-    const tableObj = {};
+  if (!Array.isArray(catalog) || catalog.length === 0) {
+    throw new Error('Nessun libro trovato nel catalogo Sanoma.');
+  }
 
-    for (const product of catalog) {
-      tableObj[product.gedi] = product.name;
-    }
+  const table = catalog.map((product, index) => ({
+    '#': index + 1,
+    'Titolo': product.name || '',
+    'GEDI': product.gedi || ''
+  }));
 
-    console.log('Books (MyPlace):');
-    console.table(tableObj);
+  console.log('');
+  console.log('Books (MyPlace):');
+  console.table(table);
 
-    const selectedProduct = catalog.find(
-      product => String(product.gedi) === String(bookGedi)
-    );
+  if (!bookGedi) {
+    const answer = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'selectedBook',
+        message: 'Seleziona libro:',
+        choices: catalog.map(product => ({
+          name: `${product.name} [GEDI: ${product.gedi}]`,
+          value: String(product.gedi)
+        }))
+      }
+    ]);
 
-    const targetBookName =
-      tableObj[bookGedi] || `GEDI ${bookGedi}`;
+    bookGedi = answer.selectedBook;
+  }
 
-    console.log(
-      'Obtaining access credentials for "' +
-      targetBookName +
-      '"...'
-    );
+  const selectedProduct = catalog.find(
+    product => String(product.gedi) === String(bookGedi)
+  );
 
-    const bookAccess = await fetchBookAccess(
+  if (!selectedProduct) {
+    throw new Error(`Libro con GEDI ${bookGedi} non trovato nel catalogo.`);
+  }
+
+  const targetBookName =
+    selectedProduct.name || `GEDI ${bookGedi}`;
+
+  console.log('');
+  console.log(
+    `Obtaining access credentials for "${targetBookName}"...`
+  );
+
+  let bookAccess;
+
+  try {
+    bookAccess = await fetchBookAccess(
       skClient,
       bookGedi,
-      selectedProduct?.placeUrl
-    ).catch(err => {
-      console.error(
-        'Failed to obtain book access:',
-        err.message
-      );
-      process.exit(1);
-    });
-
-    const baseUrl = bookAccess.baseUrl;
-
-    const headers = {
-      'Accept':
-        'application/json, text/plain, */*',
-      'Accept-Language':
-        'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Accept-Encoding':
-        'identity',
-      'Cookie':
-        bookAccess.cookieHeader,
-      'Referer':
-        'https://npmitaly-pro-apidistribucion.sanoma.it/viewers/lm60/online/index.html',
-      'Origin':
-        'https://npmitaly-pro-apidistribucion.sanoma.it',
-      'User-Agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:154.0) ' +
-        'Gecko/20100101 Firefox/154.0',
-      'Sec-Fetch-Dest':
-        'empty',
-      'Sec-Fetch-Mode':
-        'cors',
-      'Sec-Fetch-Site':
-        'same-origin',
-      'Sec-GPC':
-        '1'
-    };
-
-    const masterUrl =
-      `${baseUrl}/assets/book/data/master.json?t=${Date.now()}`;
-
-    console.log('Fetching book metadata...');
-
-    const masterRes = await fetch(
-      masterUrl,
-      { headers }
+      selectedProduct.placeUrl
     );
-
-    if (!masterRes.ok) {
-      console.error(
-        `master.json request failed: HTTP ${masterRes.status}`
-      );
-      process.exit(1);
-    }
-
-    const master = await masterRes.json();
-
-    const allPages = getPageNumbers(master);
-    const requestedPages = getRequestedPages(
-      allPages,
-      argv.pages
-    );
-
-    if (!requestedPages.length) {
-      console.error('No pages found.');
-      process.exit(1);
-    }
-
-    console.log(
-      `Found ${allPages.length} pages.`
-    );
-
-    console.log(
-      `Downloading ${requestedPages.length} page(s) sequentially...`
-    );
-
-    const pages = requestedPages.map(pageNumber => ({
-      pageNumber,
-      baseUrl: `${baseUrl}/assets/book`
-    }));
-
-    let baseName = argv.output || options.output;
-
-    if (!baseName) {
-      baseName =
-        targetBookName.replace(/[\\/:*?"<>|]/g, '') +
-        '.pdf';
-    }
-
-    if (!baseName.toLowerCase().endsWith('.pdf')) {
-      baseName += '.pdf';
-    }
-
-    const outFilePath = path.join(
-      outputDir,
-      baseName
-    );
-
-    fs.mkdirSync(
-      outputDir,
-      { recursive: true }
-    );
-
-    console.log('');
-    console.log(
-      `Creating PDF: ${outFilePath}`
-    );
-
-    await createPdf(
-      outFilePath,
-      pages,
-      headers
-    );
-
-    if (!fs.existsSync(outFilePath)) {
-      throw new Error(
-        `PDF non creato: ${outFilePath}`
-      );
-    }
-
-    const stats = fs.statSync(
-      outFilePath
-    );
-
-    if (stats.size === 0) {
-      throw new Error(
-        `PDF vuoto: ${outFilePath}`
-      );
-    }
-
-    console.log('');
-
-    console.log(
-      `Download pronto: ${path.basename(outFilePath)} - clicca per aprire`
-    );
-
-    console.log(
-      `Done. Output: ${outFilePath}`
-    );
-
-    console.log(
-      `OURBOOKS_OUTPUT:${outFilePath}`
-    );
-  })().catch(err => {
-    console.error('');
-    console.error(
-      'Errore durante la generazione del PDF:',
-      err.message
-    );
-    process.exit(1);
-  });
-}
-
-export async function login(username, password) {
-  try {
-    await loginSanoma(username, password);
-    return {
-      id: username,
-      password
-    };
   } catch (err) {
     throw new Error(
-      'Login failed: ' + err.message
+      `Failed to obtain book access: ${err.message}`
     );
   }
-}
 
-export async function getBooks(session) {
-  const { id, password } = session;
+  const baseUrl = bookAccess.baseUrl;
 
-  const skClient = await loginSanoma(
-    id,
-    password
+  const headers = {
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': 'identity',
+    'Cookie': bookAccess.cookieHeader,
+    'Referer': 'https://npmitaly-pro-apidistribucion.sanoma.it/viewers/lm60/online/index.html',
+    'Origin': 'https://npmitaly-pro-apidistribucion.sanoma.it',
+    'User-Agent':
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:154.0) ' +
+      'Gecko/20100101 Firefox/154.0',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-GPC': '1'
+  };
+
+  const masterUrl =
+    `${baseUrl}/assets/book/data/master.json?t=${Date.now()}`;
+
+  console.log('Fetching book metadata...');
+
+  const masterRes = await fetch(masterUrl, { headers });
+
+  if (!masterRes.ok) {
+    throw new Error(
+      `master.json request failed: HTTP ${masterRes.status}`
+    );
+  }
+
+  const master = await masterRes.json();
+
+  const allPages = getPageNumbers(master);
+
+  const requestedPages = getRequestedPages(
+    allPages,
+    options.pages || argv.pages
   );
 
-  const catalog = await getBookCatalog(
-    skClient
+  if (!requestedPages.length) {
+    throw new Error('No pages found.');
+  }
+
+  console.log(`Found ${allPages.length} pages.`);
+
+  console.log(
+    `Downloading ${requestedPages.length} page(s) sequentially...`
   );
 
-  return [{
-    id: 'sanoma',
-    name: 'Sanoma',
-    products: catalog.map(product => ({
-      id: product.gedi,
-      name: product.name,
-      url: product.placeUrl || ''
-    }))
-  }];
+  const pages = requestedPages.map(pageNumber => ({
+    pageNumber,
+    baseUrl: `${baseUrl}/assets/book`
+  }));
+
+  let baseName =
+    options.output ||
+    argv.output;
+
+  if (!baseName) {
+    baseName =
+      targetBookName.replace(/[\/:*?"<>|]/g, '') +
+      '.pdf';
+  }
+
+  if (!baseName.toLowerCase().endsWith('.pdf')) {
+    baseName += '.pdf';
+  }
+
+  const outFilePath = path.join(
+    outputDir,
+    baseName
+  );
+
+  fs.mkdirSync(
+    outputDir,
+    { recursive: true }
+  );
+
+  console.log('');
+
+  console.log(
+    `Creating PDF: ${outFilePath}`
+  );
+
+  await createPdf(
+    outFilePath,
+    pages,
+    headers
+  );
+
+  if (!fs.existsSync(outFilePath)) {
+    throw new Error(
+      `PDF non creato: ${outFilePath}`
+    );
+  }
+
+  const stats = fs.statSync(outFilePath);
+
+  if (stats.size === 0) {
+    throw new Error(
+      `PDF vuoto: ${outFilePath}`
+    );
+  }
+
+  console.log('');
+
+  console.log(
+    `Download pronto: ${path.basename(outFilePath)} - clicca per aprire`
+  );
+
+  console.log(
+    `Done. Output: ${outFilePath}`
+  );
+
+  console.log(
+    `OURBOOKS_OUTPUT:${outFilePath}`
+  );
 }
 
-if (
-  process.env.OURBOOKS_SANOMA_PAGE_WORKER ===
-  '1'
-) {
-  runPageWorker();
+if (process.env.OURBOOKS_SANOMA_PAGE_WORKER === '1') {
+  process.on('uncaughtException', error => {
+    console.error('Errore fatale worker Sanoma:', error);
+    process.exit(1);
+  });
+
+  process.on('unhandledRejection', error => {
+    console.error('Promise non gestita worker Sanoma:', error);
+    process.exit(1);
+  });
+
+  runPageWorker().catch(error => {
+    console.error('Errore worker Sanoma:', error);
+    process.exit(1);
+  });
 }

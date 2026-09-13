@@ -4,3 +4,4 @@ tmp/
 *.pdf
 *.epub
 .DS_Store
+*.svg

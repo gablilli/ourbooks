@@ -1,19 +1,19 @@
-import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { PDFDocument as CantooPDFDocument } from '@cantoo/pdf-lib';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import inquirer from 'inquirer';
 
 export async function run(options = {}) {
-  const {
-    username,
-    password,
-    isbn,
-    output
-  } = options;
+    const {
+        username,
+        password,
+        isbn,
+        output
+    } = options;
 
-  const argv = yargs(hideBin(process.argv.slice(2)))
+    const argv = yargs(hideBin(process.argv.slice(2)))
         .option('username', {
             describe: 'Email account DiBook Laterza',
             type: 'string',
@@ -29,26 +29,6 @@ export async function run(options = {}) {
             type: 'string',
             default: null
         })
-        .option('pdftkJava', {
-            describe: 'The path to the pdftk-java jar file',
-            type: 'string',
-            default: './pdftk-all.jar'
-        })
-        .option('javaPath', {
-            describe: 'Path to java executable',
-            type: 'string',
-            default: 'java'
-        })
-        .option('useSystemExecutable', {
-            describe: 'Use the executable directly instead of running the jar with java, this is usefuly if you are on linux where most package managers install the java version by default thus you don\'t need java',
-            type: 'boolean',
-            default: false
-        })
-        .option('pdftkPath', {
-            describe: 'Path to pdftk executable',
-            type: 'string',
-            default: 'pdftk'
-        })
         .option('output', {
             describe: 'Output filename',
             type: 'string',
@@ -57,158 +37,371 @@ export async function run(options = {}) {
         .help()
         .argv;
 
-    function pdftk(...args) {
-        if (argv.useSystemExecutable) {
-            return spawn(argv.pdftkPath, args);
-        } else {
-            return spawn(argv.javaPath, ['-jar', argv.pdftkJava, ...args]);
+    async function removePassword(password, input, output) {
+        await fs.promises.mkdir(
+            path.dirname(output),
+            { recursive: true }
+        );
+
+        const encryptedBytes = new Uint8Array(
+            await fs.promises.readFile(input)
+        );
+
+        try {
+            const pdfDoc = await CantooPDFDocument.load(
+                encryptedBytes,
+                { password }
+            );
+
+            const decryptedBytes = await pdfDoc.save();
+
+            await fs.promises.writeFile(
+                output,
+                Buffer.from(decryptedBytes)
+            );
+        } catch (error) {
+            throw new Error(
+                `Impossibile decrittare ${input}: ${error.message}`
+            );
         }
     }
 
-    function removePassword(password, input, output) {
-        return new Promise(async (resolve, reject) => {
-            if (!fs.existsSync(path.dirname(output))) {
-                await fs.promises.mkdir(path.dirname(output), { recursive: true });
-            }
+    async function mergePages(pages, output) {
+        await fs.promises.mkdir(
+            path.dirname(output),
+            { recursive: true }
+        );
 
-            let converter = pdftk(input, 'input_pw', password, 'output', output);
-            converter.on('close', resolve);
+        const { spawn } = await import('child_process');
+
+        await new Promise((resolve, reject) => {
+            const process = spawn(
+                'pdfunite',
+                [...pages, output],
+                {
+                    stdio: ['ignore', 'pipe', 'pipe']
+                }
+            );
+
+            let stderr = '';
+
+            process.stderr.on('data', data => {
+                stderr += data.toString();
+            });
+
+            process.on('error', error => {
+                reject(
+                    new Error(
+                        `Impossibile avviare pdfunite: ${error.message}`
+                    )
+                );
+            });
+
+            process.on('close', code => {
+                if (code !== 0) {
+                    reject(
+                        new Error(
+                            `pdfunite ha restituito codice ${code}: ${stderr.trim()}`
+                        )
+                    );
+                    return;
+                }
+
+                resolve();
+            });
         });
     }
 
-    function mergePages(pages, output) {
-        return new Promise(async (resolve, reject) => {
-            if (!fs.existsSync(path.dirname(output))) {
-                await fs.promises.mkdir(path.dirname(output), { recursive: true });
-            }
+    const sessionTmp =
+        process.env.OURBOOKS_SESSION_TMP || './tmp';
 
-            let merger = pdftk(...pages, 'cat', 'output', output);
-            merger.on('close', resolve);
-        });
+    const outputDir =
+        process.env.OURBOOKS_OUTPUT_DIR || '.';
+
+    let userEmail = username || argv.username;
+    let userPassword = password || argv.password;
+
+    if (!userEmail) {
+        const ans = await inquirer.prompt([
+            {
+                type: 'input',
+                name: 'v',
+                message: 'Email account DiBook Laterza:'
+            }
+        ]);
+
+        userEmail = ans.v;
     }
 
-    (async () => {
-        if (!argv.useSystemExecutable && !fs.existsSync(argv.pdftkJava)) {
-            console.error('pdftk-all.jar non trovato.\nAssicurati che il file esista in ./pdftk-all.jar oppure usa --useSystemExecutable con pdftk installato nel sistema.');
-            process.exitCode = 1;
-            return;
-        }
+    if (!userPassword) {
+        const ans = await inquirer.prompt([
+            {
+                type: 'password',
+                name: 'v',
+                message: 'Password:'
+            }
+        ]);
 
-        const sessionTmp = process.env.OURBOOKS_SESSION_TMP || './tmp';
-        const outputDir = process.env.OURBOOKS_OUTPUT_DIR || '.';
+        userPassword = ans.v;
+    }
 
-        let userEmail = username || argv.username;
-        let userPassword = password || argv.password;
+    console.log('Accesso a DiBook Laterza...');
 
-        if (!userEmail) {
-            const ans = await inquirer.prompt([{ type: 'input', name: 'v', message: 'Email account DiBook Laterza:' }]);
-            userEmail = ans.v;
-        }
-        if (!userPassword) {
-            const ans = await inquirer.prompt([{ type: 'password', name: 'v', message: 'Password:' }]);
-            userPassword = ans.v;
-        }
-
-        // Login
-        console.log("Accesso a DiBook Laterza...");
-        const loginRes = await fetch('https://api.dibooklaterza.it/api/identity/login', {
+    const loginRes = await fetch(
+        'https://api.dibooklaterza.it/api/identity/login',
+        {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: userEmail, password: userPassword })
-        });
-
-        if (!loginRes.ok) {
-            throw new Error(`Login fallito: ${loginRes.status} ${loginRes.statusText}`);
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                username: userEmail,
+                password: userPassword
+            })
         }
+    );
 
-        const loginData = await loginRes.json();
-        const jwtToken = loginData.jwt;
-        const laterzaUserId = loginData.laterzaUserId;
+    if (!loginRes.ok) {
+        throw new Error(
+            `Login fallito: ${loginRes.status} ${loginRes.statusText}`
+        );
+    }
 
-        if (!jwtToken || !laterzaUserId) {
-            throw new Error("Login fallito: risposta non valida");
-        }
+    const loginData = await loginRes.json();
 
-        // Recupera lista libri
-        console.log("Recupero lista libri...");
-        const booksRes = await fetch(`https://api.dibooklaterza.it/api/management/books/${laterzaUserId}`, {
-            headers: { 'Authorization': `Bearer ${jwtToken}` }
-        });
+    const jwtToken = loginData.jwt;
+    const laterzaUserId = loginData.laterzaUserId;
 
-        if (!booksRes.ok) {
-            throw new Error(`Impossibile recuperare i libri: ${booksRes.status} ${booksRes.statusText}`);
-        }
+    if (!jwtToken || !laterzaUserId) {
+        throw new Error(
+            'Login fallito: risposta non valida'
+        );
+    }
 
-        const booksData = await booksRes.json();
+    console.log('Recupero lista libri...');
 
-        // Trova la categoria "libreria"
-        const libreriaCategory = booksData.categories?.find(c => c.name?.toLowerCase() === 'libreria');
-        if (!libreriaCategory) {
-            throw new Error("Categoria 'libreria' non trovata");
-        }
-
-        const libreriaBooks = (booksData.books || []).filter(b => b.category === libreriaCategory.id && b.permitDownload && b.existPdf);
-
-        if (libreriaBooks.length === 0) {
-            throw new Error("Nessun libro scaricabile trovato nella libreria");
-        }
-
-        // Seleziona il libro
-        let bookIsbn = isbn ? String(isbn) : (argv.isbn ? String(argv.isbn) : null);
-        if (!bookIsbn) {
-            const { selectedIsbn } = await inquirer.prompt([{
-                type: 'list',
-                name: 'selectedIsbn',
-                message: 'Seleziona il libro da scaricare:',
-                choices: libreriaBooks.map(b => ({
-                    name: `${b.title} (${b.identifier})`,
-                    value: b.identifier
-                }))
-            }]);
-            bookIsbn = selectedIsbn;
-        }
-
-        let authorization = 'Bearer ' + jwtToken;
-
-        console.log("Fetching book index");
-        
-        let bookIndex = await fetch(`https://api.dibooklaterza.it/api/reader/${bookIsbn}/index`, {
-            headers: {authorization}
-        }).then(res => res.json());
-
-        console.log(`Downloading ${bookIndex.name}`);
-
-        let pages = [];
-        const bookPassword = `AB8374JJ${bookIsbn.padEnd(16, "0")}H48js83A`;
-        
-        await fs.promises.mkdir(sessionTmp, {recursive: true});
-
-        for (let i = 0; i < bookIndex.chapters.length; i++) {
-            let chapter = bookIndex.chapters[i];
-            for (let j = 0; j < chapter.pageLabels.length; j++) {
-                console.log(`Downloading page ${chapter.pageLabels[j]}`);
-                pages.push(`${chapter.id}/${chapter.pageLabels[j]}.pdf`);
-                fs.promises.mkdir(`${sessionTmp}/password/${chapter.id}`, {recursive: true})
-                let pageUrl = await fetch(`https://api.dibooklaterza.it/api/reader/${bookIsbn}/${chapter.id}/pdf-secure/${chapter.pageLabels[j]}`, {
-                    headers: {authorization}
-                }).then(res => res.text());
-                let page = await fetch(pageUrl).then(res => res.arrayBuffer());
-                await fs.promises.writeFile(`${sessionTmp}/password/${chapter.id}/${chapter.pageLabels[j]}.pdf`, Buffer.from(new Uint8Array(page)));
-                await removePassword(bookPassword, `${sessionTmp}/password/${chapter.id}/${chapter.pageLabels[j]}.pdf`, `${sessionTmp}/pages/${chapter.id}/${chapter.pageLabels[j]}.pdf`);
+    const booksRes = await fetch(
+        `https://api.dibooklaterza.it/api/management/books/${laterzaUserId}`,
+        {
+            headers: {
+                Authorization: `Bearer ${jwtToken}`
             }
         }
+    );
 
-        console.log("Merging pages");
+    if (!booksRes.ok) {
+        throw new Error(
+            `Impossibile recuperare i libri: ` +
+            `${booksRes.status} ${booksRes.statusText}`
+        );
+    }
 
-        const outFileName = bookIndex.name.replace(/[^a-z0-9]/gi, '_') + '.pdf';
-        const outFilePath = path.join(outputDir, outFileName);
-        await mergePages(pages.map(p => `${sessionTmp}/pages/${p}`), outFilePath);
+    const booksData = await booksRes.json();
 
-        console.log("Cleaning up");
+    const libreriaCategory =
+        booksData.categories?.find(
+            c => c.name?.toLowerCase() === 'libreria'
+        );
 
-        await fs.promises.rm(sessionTmp, { recursive: true, force: true });
+    if (!libreriaCategory) {
+        throw new Error(
+            "Categoria 'libreria' non trovata"
+        );
+    }
 
-        console.log(`Done! File salvato: ${outFilePath}`);
-        console.log(`OURBOOKS_OUTPUT:${outFilePath}`);
-    })();
+    const libreriaBooks =
+        (booksData.books || []).filter(
+            b =>
+                b.category === libreriaCategory.id &&
+                b.permitDownload &&
+                b.existPdf
+        );
+
+    if (libreriaBooks.length === 0) {
+        throw new Error(
+            'Nessun libro scaricabile trovato nella libreria'
+        );
+    }
+
+    let bookIsbn = isbn
+        ? String(isbn)
+        : argv.isbn
+            ? String(argv.isbn)
+            : null;
+
+    if (!bookIsbn) {
+        const { selectedIsbn } =
+            await inquirer.prompt([
+                {
+                    type: 'list',
+                    name: 'selectedIsbn',
+                    message: 'Seleziona il libro da scaricare:',
+                    choices: libreriaBooks.map(b => ({
+                        name: `${b.title} (${b.identifier})`,
+                        value: b.identifier
+                    }))
+                }
+            ]);
+
+        bookIsbn = selectedIsbn;
+    }
+
+    const authorization =
+        `Bearer ${jwtToken}`;
+
+    console.log('Fetching book index...');
+
+    const indexRes = await fetch(
+        `https://api.dibooklaterza.it/api/reader/${bookIsbn}/index`,
+        {
+            headers: {
+                authorization
+            }
+        }
+    );
+
+    if (!indexRes.ok) {
+        throw new Error(
+            `Impossibile recuperare l'indice: ` +
+            `${indexRes.status} ${indexRes.statusText}`
+        );
+    }
+
+    const bookIndex = await indexRes.json();
+
+    console.log(`Downloading ${bookIndex.name}`);
+
+    const bookPassword =
+        `AB8374JJ${bookIsbn.padEnd(16, '0')}H48js83A`;
+
+    await fs.promises.mkdir(
+        sessionTmp,
+        { recursive: true }
+    );
+
+    const pages = [];
+
+    for (const chapter of bookIndex.chapters) {
+        for (const pageLabel of chapter.pageLabels) {
+            console.log(
+                `Downloading page ${pageLabel}`
+            );
+
+            const encryptedDir = path.join(
+                sessionTmp,
+                'encrypted',
+                String(chapter.id)
+            );
+
+            const decryptedDir = path.join(
+                sessionTmp,
+                'pages',
+                String(chapter.id)
+            );
+
+            await fs.promises.mkdir(
+                encryptedDir,
+                { recursive: true }
+            );
+
+            await fs.promises.mkdir(
+                decryptedDir,
+                { recursive: true }
+            );
+
+            const encryptedPath = path.join(
+                encryptedDir,
+                `${pageLabel}.pdf`
+            );
+
+            const decryptedPath = path.join(
+                decryptedDir,
+                `${pageLabel}.pdf`
+            );
+
+            const pageUrlRes = await fetch(
+                `https://api.dibooklaterza.it/api/reader/` +
+                `${bookIsbn}/${chapter.id}/pdf-secure/${pageLabel}`,
+                {
+                    headers: {
+                        authorization
+                    }
+                }
+            );
+
+            if (!pageUrlRes.ok) {
+                throw new Error(
+                    `Errore nel recupero della pagina ${pageLabel}: ` +
+                    `${pageUrlRes.status} ${pageUrlRes.statusText}`
+                );
+            }
+
+            const pageUrl =
+                await pageUrlRes.text();
+
+            const pageRes =
+                await fetch(pageUrl);
+
+            if (!pageRes.ok) {
+                throw new Error(
+                    `Errore nel download della pagina ${pageLabel}: ` +
+                    `${pageRes.status} ${pageRes.statusText}`
+                );
+            }
+
+            const page =
+                await pageRes.arrayBuffer();
+
+            await fs.promises.writeFile(
+                encryptedPath,
+                Buffer.from(page)
+            );
+
+            await removePassword(
+                bookPassword,
+                encryptedPath,
+                decryptedPath
+            );
+
+            if (pageLabel === '17') {
+                console.log(`Test PDF decrittato: ${decryptedPath}`);
+            }
+                        pages.push(decryptedPath);
+                    }
+                }
+
+    console.log('Merging pages...');
+
+    const outFileName =
+        bookIndex.name
+            .replace(/[^a-z0-9]/gi, '_') +
+        '.pdf';
+
+    const outFilePath = path.join(
+        outputDir,
+        output || outFileName
+    );
+
+    await mergePages(
+        pages,
+        outFilePath
+    );
+
+    console.log('Cleaning up...');
+
+    await fs.promises.rm(
+        sessionTmp,
+        {
+            recursive: true,
+            force: true
+        }
+    );
+
+    console.log(
+        `Done! File salvato: ${outFilePath}`
+    );
+
+    console.log(
+        `OURBOOKS_OUTPUT:${outFilePath}`
+    );
 }
