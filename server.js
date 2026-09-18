@@ -7,7 +7,10 @@ import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import { performBsmartLogin, getBooks, getUserInfo } from './providers/src/bsmart/api.js';
-import * as sanomaProvider from './providers/sanoma.js';
+import {
+  loginSanoma,
+  getBookCatalog
+} from './providers/src/sanoma/auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -146,19 +149,18 @@ app.post('/api/sanoma-gedi', async (req, res) => {
   }
 
   try {
-    const rawBooks = await sanomaProvider.getBooks({ id, password });
+    const client = await loginSanoma(id, password);
+    const catalog = await getBookCatalog(client);
 
-    const bookList = [];
-    for (const b of rawBooks) {
-        for (const p of b.products) {
-            bookList.push({
-               gedi: p.id,
-               name: p.name
-            });
-        }
-    }
+    const books = catalog.map(book => ({
+      gedi: book.gedi,
+      name: book.name
+    }));
 
-    res.status(200).json({ success: true, books: bookList });
+    res.status(200).json({
+      success: true,
+      books
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
