@@ -586,8 +586,6 @@ function drawInvisibleTextLayer(doc, textPage) {
 		const fontSize = Math.max(1, height * 0.85);
 		const options = {
 			lineBreak: false,
-			width,
-			height,
 			paragraphGap: 0,
 			characterSpacing: 0,
 			features: { liga: false },
@@ -595,11 +593,13 @@ function drawInvisibleTextLayer(doc, textPage) {
 
 		doc.fontSize(fontSize);
 		const measuredWidth = doc.widthOfString(run.text, options);
-		if (measuredWidth > 0) {
-			options.horizontalScaling = (width / measuredWidth) * 100;
-		}
+		const scaleX = measuredWidth > 0 ? width / measuredWidth : 1;
 
-		doc.text(run.text, run.x * xScale, run.y * yScale, options);
+		doc.save();
+		doc.translate(run.x * xScale, run.y * yScale);
+		doc.scale(scaleX, 1);
+		doc.text(run.text, 0, 0, options);
+		doc.restore();
 	}
 
 	doc.restore();
