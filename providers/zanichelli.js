@@ -1128,55 +1128,87 @@ export async function run(options = {}) {
 
 	console.log("Logging in...");
 
-	let token = await fetch("https://idp.zanichelli.it/v4/login/", {
+	const loginResponse = await fetch("https://idp.zanichelli.it/v4/login/", {
 		method: "POST",
 		headers: {
 			"content-type": "application/x-www-form-urlencoded",
+			"user-agent": USER_AGENT,
 		},
 		body: `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`,
-	}).then((res) => res.json()).then((res) => res.token).catch((err) => {
-		console.log("Error: ", err);
-		process.exit(1);
 	});
 
-	let cookie = `token=${token}`;
-
-	let loginCookies = await fetch("https://my.zanichelli.it/?loginMode=myZanichelli", {
-		headers: { cookie },
-	}).then((res) => {
-		const rawCookies = res.headers.raw ? res.headers.raw()['set-cookie'] : res.headers.getSetCookie();
-		return (rawCookies || []).map((cookie) => cookie.split(';')[0]);
-	}).catch((err) => {
-		console.log("Error: ", err);
+	const loginBody = await loginResponse.json().catch(() => ({}));
+	if (!loginResponse.ok || !loginBody.token) {
+		console.error(`Zanichelli login failed (HTTP ${loginResponse.status}).`);
+		console.error(loginBody.message || loginBody.error || "The login response did not contain a token.");
 		process.exit(1);
-	});
-
-	let dashboardCookies = {};
-
-	for (let loginCookie of loginCookies) {
-		let [key, value] = loginCookie.split('=');
-		dashboardCookies[key] = value;
 	}
-	const sessionCookieHeader = mergeCookieHeaders([cookie], loginCookies);
 
+	const idpCookie = `token=${loginBody.token}`;
+	const myzResponse = await fetch("https://my.zanichelli.it/?loginMode=myZanichelli", {
+		headers: { cookie: idpCookie, "user-agent": USER_AGENT },
+	});
+
+	if (!myzResponse.ok) {
+		console.error(`Unable to open myZanichelli (HTTP ${myzResponse.status}).`);
+		process.exit(1);
+	}
+
+	const loginCookies = getSetCookies(myzResponse).map((value) => String(value).split(';')[0]);
+	const sessionCookieHeader = mergeCookieHeaders([idpCookie], loginCookies);
+	const cookieMap = new Map();
+	for (const [key, value] of extractCookiePairs(sessionCookieHeader)) {
+		cookieMap.set(key.toLowerCase(), value);
+	}
+
+	let myzToken = cookieMap.get('myz_token') || cookieMap.get('myz-token');
+	if (!myzToken) {
+		console.error("Login completed, but Zanichelli did not return the myz-token cookie.");
+		console.error("Cookie names received:", [...cookieMap.keys()].join(', ') || '(none)');
+		console.error("The session cannot access the book catalogue without this token.");
+		process.exit(1);
+	}
+
+	const dashboardHeaders = {
+		'myz-token': myzToken,
+		'origin': 'https://my.zanichelli.it',
+		'referer': 'https://my.zanichelli.it/',
+		'user-agent': USER_AGENT,
+	};
+
+	console.log("Initializing Zanichelli dashboard session...");
+	const initResponse = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/init', {
+		headers: dashboardHeaders,
+	});
+	const initText = await initResponse.text();
+	if (!initResponse.ok && initResponse.status !== 204) {
+		console.error(`Dashboard initialization failed (HTTP ${initResponse.status}).`);
+		console.error(initText.slice(0, 500));
+		process.exit(1);
+	}
+	if (initText) {
+		try {
+			const initData = JSON.parse(initText);
+			if (initData.token) {
+				myzToken = initData.token;
+				dashboardHeaders['myz-token'] = myzToken;
+			}
+		} catch {}
+	}
+
+	const userResponse = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/user', {
+		headers: dashboardHeaders,
+	});
+	const userText = await userResponse.text();
+	if (!userResponse.ok) {
+		console.error(`Zanichelli dashboard authentication failed (HTTP ${userResponse.status}).`);
+		console.error(userText.slice(0, 500));
+		process.exit(1);
+	}
+	let userData = {};
+	try { userData = JSON.parse(userText); } catch {}
+	console.log(`Logged in as: ${userData.firstName || ''} ${userData.lastName || ''}`.trim());
 	console.log("Fetching available books...");
-
-	/*await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/init', {
-		headers: { 'myz-token': dashboardCookies['myz_token'] },
-	}).then(res => res.text()).then(console.log).catch((err) => {
-		console.log("Error: ", err);
-		process.exit(1);
-	});*/ // keeping this, perhaps it's needed in the future
-
-	await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/user', {
-		headers: { 'myz-token': dashboardCookies['myz_token'] },
-	}).then(res => res.json()).then((res) => {
-		console.log(`Logged in as: ${res.firstName} ${res.lastName}`)
-	}).catch((err) => {
-		console.log("Error: ", err);
-		process.exit(1);
-	}); // we don't really care about the response, but apparently it's required to access the book list
-
 
 	let books = {};
 
@@ -1205,8 +1237,6 @@ export async function run(options = {}) {
 		}
 	};
 
-	const dashboardHeaders = { 'myz-token': dashboardCookies['myz_token'] };
-
 	console.log("Fetching real book licenses...");
 
 	try {
@@ -1214,11 +1244,15 @@ export async function run(options = {}) {
 			headers: dashboardHeaders,
 		});
 
+		const realText = await realResponse.text();
 		if (realResponse.ok) {
-			const realData = await realResponse.json();
-			for (const license of realData.realLicenses || []) addBook(license);
+			let realData = {};
+			try { realData = JSON.parse(realText); } catch {}
+			const licenses = realData.realLicenses || realData.data?.realLicenses || [];
+			console.log(`licenses/real: HTTP ${realResponse.status}, ${Array.isArray(licenses) ? licenses.length : 0} licenses received.`);
+			for (const license of (Array.isArray(licenses) ? licenses : Object.values(licenses))) addBook(license);
 		} else {
-			console.warn(`licenses/real returned HTTP ${realResponse.status}`);
+			console.warn(`licenses/real returned HTTP ${realResponse.status}: ${realText.slice(0, 500)}`);
 		}
 	} catch (err) {
 		console.warn("Unable to fetch real licenses:", err.message);
@@ -1256,7 +1290,7 @@ export async function run(options = {}) {
 	if (Object.keys(books).length === 0) {
 		console.error("No downloadable books found.");
 		console.error("The account was authenticated, but both Zanichelli library endpoints returned no usable licenses.");
-		console.error("Check the myz-token and the responses from /v3/dashboard/licenses/real and /v3/dashboard/search.");
+		console.error("No usable license was returned. The HTTP status and response body above should identify whether this is authentication or a changed API response.");
 		process.exit(1);
 	}
 
