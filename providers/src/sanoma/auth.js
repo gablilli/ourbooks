@@ -13,9 +13,121 @@ const DEFAULT_HEADERS = {
     'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7'
 };
 
+const HTML_ACCEPT = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8';
+const PLACE_LOGIN_URL = 'https://place.sanoma.it/login';
+const MAX_REDIRECTS = 20;
+
+function isUniversalLoginUrl(url) {
+    const parsed = new URL(url);
+    return parsed.host === 'login.sanoma.it' && parsed.pathname.startsWith('/u/login');
+}
+
+// axios is configured with maxRedirects: 0, so redirects are followed by hand.
+// Errors with a response (4xx/5xx) are returned instead of thrown so the caller can read the page.
+async function sendRequest(client, config) {
+    try {
+        return await client.request(config);
+    } catch (err) {
+        if (err.response) return err.response;
+        throw err;
+    }
+}
+
+async function followRedirects(client, startUrl, referer) {
+    let url = startUrl;
+    let currentReferer = referer;
+
+    for (let hop = 0; hop < MAX_REDIRECTS; hop++) {
+        const res = await sendRequest(client, {
+            method: 'get',
+            url,
+            headers: {
+                'Referer': currentReferer,
+                'Accept': HTML_ACCEPT
+            }
+        });
+
+        if (res.status >= 300 && res.status < 400 && res.headers?.location) {
+            currentReferer = url;
+            url = new URL(res.headers.location, url).toString();
+            continue;
+        }
+
+        return { res, url };
+    }
+
+    throw new Error('Too many redirects during Sanoma login');
+}
+
+function extractAuth0Error(html) {
+    if (typeof html !== 'string') return null;
+
+    const $ = cheerio.load(html);
+    const message = $('.ulp-input-error-message, .ulp-error-info, #error-element-username, #error-element-password')
+        .first()
+        .text()
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    return message || null;
+}
+
+function assertNoCaptcha(html, step) {
+    const $ = cheerio.load(html);
+    if ($('input[name="captcha"]').length > 0) {
+        throw new Error(`Login failed: Sanoma requires a captcha at the ${step} step. Log in once from the browser and try again.`);
+    }
+}
+
+function getFormState(html, pageUrl) {
+    const $ = cheerio.load(html);
+    const fromForm = $('form[data-form-primary="true"] input[name="state"]').first().val()
+        || $('input[name="state"]').first().val();
+
+    return fromForm || new URL(pageUrl).searchParams.get('state');
+}
+
+// Legacy entry point: the old /login page posted the email to a SvelteKit action,
+// which answered with the Auth0 authorize URL.
+async function getAuthorizeUrlFromLegacyAction(client, email) {
+    const initParams = new URLSearchParams({
+        ref: 'https://place.sanoma.it/',
+        context: '',
+        text: email
+    });
+
+    const initRes = await sendRequest(client, {
+        method: 'post',
+        url: 'https://place.sanoma.it/login?/status',
+        data: initParams.toString(),
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json',
+            'Origin': 'https://place.sanoma.it',
+            'Referer': PLACE_LOGIN_URL,
+            'x-sveltekit-action': 'true'
+        }
+    });
+
+    let data = initRes.data;
+    if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch (e) {}
+    }
+
+    if (data && data.type === 'redirect' && data.location) {
+        return new URL(data.location, 'https://login.sanoma.it').toString();
+    }
+
+    if (initRes.headers?.location) {
+        return new URL(initRes.headers.location, 'https://login.sanoma.it').toString();
+    }
+
+    throw new Error(`Sanoma login flow has changed (POST /login?/status answered ${initRes.status}).`);
+}
+
 export async function loginSanoma(email, password) {
     const jar = new CookieJar();
-    const client = wrapper(axios.create({ 
+    const client = wrapper(axios.create({
         jar,
         withCredentials: true,
         maxRedirects: 0,
@@ -25,183 +137,103 @@ export async function loginSanoma(email, password) {
             'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7'
         }
     }));
-    
-    const redirectUri = 'https://place.sanoma.it/';
-    let authUrl = null;
-    let clientId = null;
-    
-    try {
-        await client.get('https://place.sanoma.it/login', {
-            headers: { 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' }
-        });
 
-        const initParams = new URLSearchParams({
-            ref: 'https://place.sanoma.it/',
-            context: '',
-            text: email
-        });
+    // reach auth0
+    let { res: identifierRes, url: identifierUrl } = await followRedirects(
+        client,
+        PLACE_LOGIN_URL,
+        'https://place.sanoma.it/'
+    );
 
-        const initRes = await client.post('https://place.sanoma.it/login?/status', initParams.toString(), {
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json',
-                'Origin': 'https://place.sanoma.it',
-                'Referer': 'https://place.sanoma.it/login',
-                'x-sveltekit-action': 'true'
-            }
-        });
-        
-        let data = initRes.data;
-        if (typeof data === 'string') {
-            try { data = JSON.parse(data); } catch (e) {}
-        }
-        
-        if (data && data.type === 'redirect' && data.location) {
-            authUrl = data.location;
-        }
-    } catch (err) {
-        if (err.response?.data?.type === 'redirect' && err.response?.data?.location) {
-            authUrl = err.response.data.location;
-        } else if (err.response?.headers?.location) {
-            authUrl = err.response.headers.location;
-        } else {
-            throw err;
-        }
+    if (!isUniversalLoginUrl(identifierUrl)) {
+        const authUrl = await getAuthorizeUrlFromLegacyAction(client, email);
+        ({ res: identifierRes, url: identifierUrl } = await followRedirects(client, authUrl, 'https://place.sanoma.it/'));
     }
-    
-    if (!authUrl) throw new Error('Failed to get Auth0 redirect URL from /login?/status');
-    if (!authUrl.startsWith('http')) authUrl = 'https://login.sanoma.it' + (authUrl.startsWith('/') ? '' : '/') + authUrl;
-    
-    const parsedInitUrl = new URL(authUrl);
-    clientId = parsedInitUrl.searchParams.get('client_id');
-    if (!clientId) throw new Error('Client ID missing from SvelteKit authorization URL');
 
-    let authPageRes = await client.get(authUrl, {
+    if (!isUniversalLoginUrl(identifierUrl) || identifierRes.status !== 200 || typeof identifierRes.data !== 'string') {
+        throw new Error(`Login failed: unexpected login page (${identifierRes.status} ${identifierUrl}).`);
+    }
+
+    assertNoCaptcha(identifierRes.data, 'identifier');
+
+    // 2. submit the email.
+    const identifierState = getFormState(identifierRes.data, identifierUrl);
+    if (!identifierState) throw new Error('Login failed: state parameter not found on the identifier page.');
+
+    const identifierBody = new URLSearchParams({
+        'state': identifierState,
+        'username': email,
+        'js-available': 'true',
+        'webauthn-available': 'true',
+        'is-brave': 'false',
+        'webauthn-platform-available': 'true'
+    });
+
+    const identifierPost = await sendRequest(client, {
+        method: 'post',
+        url: identifierUrl,
+        data: identifierBody.toString(),
         headers: {
-            'Referer': 'https://place.sanoma.it/',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': 'https://login.sanoma.it',
+            'Referer': identifierUrl,
+            'Accept': HTML_ACCEPT
         }
     });
-    
-    while (authPageRes.status >= 300 && authPageRes.status < 400 && authPageRes.headers.location) {
-        let nextUrl = authPageRes.headers.location;
-        if (!nextUrl.startsWith('http')) nextUrl = 'https://login.sanoma.it' + nextUrl;
-        authUrl = nextUrl;
-        authPageRes = await client.get(authUrl, {
-            headers: {
-                'Referer': 'https://place.sanoma.it/',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-            }
-        });
-    }
-    
-    const $ = cheerio.load(authPageRes.data);
-    const cookies = await jar.getCookies('https://login.sanoma.it');
-    const csrfCookie = cookies.find(c => c.key === '_csrf');
-    const csrfToken = $('input[name="_csrf"]').val() || (csrfCookie ? csrfCookie.value : '');
-    
-    const parsedUrl = new URL(authUrl);
-    const state = parsedUrl.searchParams.get('state');
-    if (!state) throw new Error('State parameter not found in Auth0 URL');
 
-    const loginPayload = {
-        client_id: clientId,
-        redirect_uri: redirectUri,
-        tenant: "sanoma-italy",
-        response_type: "code",
-        scope: "openid profile email",
-        state,
-        connection: "Sanoma-Italy-Database",
-        username: email,
-        password,
-        popup_options: {},
-        sso: true,
-        protocol: "oauth2",
-        _csrf: csrfToken,
-        _intstate: "deprecated"
-    };
-
-    let loginRes;
-    try {
-        loginRes = await client.post('https://login.sanoma.it/usernamepassword/login', loginPayload, {
-            headers: {
-                'Content-Type': 'application/json',
-                'Origin': 'https://login.sanoma.it',
-                'Referer': authUrl,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-            }
-        });
-    } catch (err) {
-        throw new Error(`Login failed: ${err.response?.status ?? 'Unknown'} ${err.response?.statusText ?? ''}`);
+    if (!(identifierPost.status >= 300 && identifierPost.status < 400 && identifierPost.headers?.location)) {
+        const reason = extractAuth0Error(identifierPost.data) || `HTTP ${identifierPost.status}`;
+        throw new Error(`Login failed: ${reason}`);
     }
 
-    const $login = cheerio.load(loginRes.data);
-    const wa      = $login('input[name="wa"]').val();
-    const wresult = $login('input[name="wresult"]').val();
-    const wctx    = $login('input[name="wctx"]').val();
+    // 3. Password page.
+    const { res: passwordRes, url: passwordUrl } = await followRedirects(
+        client,
+        new URL(identifierPost.headers.location, identifierUrl).toString(),
+        identifierUrl
+    );
 
-    if (!wa || !wresult || !wctx) {
-        throw new Error('Login failed: callback form not found (wrong credentials?)');
+    if (passwordRes.status !== 200 || typeof passwordRes.data !== 'string' || !passwordUrl.includes('/u/login/password')) {
+        throw new Error(`Login failed: unexpected password page (${passwordRes.status} ${passwordUrl}).`);
     }
 
-    let finalCodeUrl = null;
-    try {
-        const callbackRes = await client.post(
-            'https://login.sanoma.it/login/callback',
-            `wa=${encodeURIComponent(wa)}&wresult=${encodeURIComponent(wresult)}&wctx=${encodeURIComponent(wctx)}`,
-            {
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Origin': 'https://login.sanoma.it',
-                    'Referer': 'https://login.sanoma.it/',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                }
-            }
-        );
-        if (callbackRes.status >= 300 && callbackRes.status < 400) {
-            finalCodeUrl = callbackRes.headers.location;
+    assertNoCaptcha(passwordRes.data, 'password');
+
+    const passwordState = getFormState(passwordRes.data, passwordUrl);
+    if (!passwordState) throw new Error('Login failed: state parameter not found on the password page.');
+
+    const passwordBody = new URLSearchParams({
+        'state': passwordState,
+        'username': email,
+        'password': password
+    });
+
+    const passwordPost = await sendRequest(client, {
+        method: 'post',
+        url: passwordUrl,
+        data: passwordBody.toString(),
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': 'https://login.sanoma.it',
+            'Referer': passwordUrl,
+            'Accept': HTML_ACCEPT
         }
-    } catch(err) {
-        if (err.response?.status >= 300 && err.response?.status < 400) {
-            finalCodeUrl = err.response.headers.location;
-        } else {
-            throw err;
-        }
+    });
+
+    if (!(passwordPost.status >= 300 && passwordPost.status < 400 && passwordPost.headers?.location)) {
+        const reason = extractAuth0Error(passwordPost.data) || `HTTP ${passwordPost.status} (wrong credentials?)`;
+        throw new Error(`Login failed: ${reason}`);
     }
 
-    if (!finalCodeUrl) throw new Error('Final redirect URL not found after callback');
+    // 4. /authorize/resume -> place.sanoma.it/?code=... -> /login/callback -> /
+    const { res: finalRes, url: finalUrl } = await followRedirects(
+        client,
+        new URL(passwordPost.headers.location, passwordUrl).toString(),
+        passwordUrl
+    );
 
-    if (!finalCodeUrl.startsWith('http')) {
-        finalCodeUrl = finalCodeUrl.startsWith('/authorize')
-            ? 'https://login.sanoma.it' + finalCodeUrl
-            : 'https://place.sanoma.it' + (finalCodeUrl.startsWith('/') ? '' : '/') + finalCodeUrl;
-    }
-    
-    let currentUrl = finalCodeUrl;
-    for (let i = 0; i < 15; i++) {
-        try {
-            const res = await client.get(currentUrl, {
-                headers: {
-                    'Referer': i === 0 ? 'https://login.sanoma.it/' : currentUrl,
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                }
-            });
-            if (res.status >= 300 && res.status < 400 && res.headers.location) {
-                let next = res.headers.location;
-                if (!next.startsWith('http')) next = next.startsWith('/authorize') ? 'https://login.sanoma.it' + next : 'https://place.sanoma.it' + next;
-                currentUrl = next;
-            } else {
-                break;
-            }
-        } catch (err) {
-            if (err.response?.status >= 300 && err.response?.status < 400) {
-                let next = err.response.headers.location;
-                if (!next.startsWith('http')) next = next.startsWith('/authorize') ? 'https://login.sanoma.it' + next : 'https://place.sanoma.it' + next;
-                currentUrl = next;
-            } else {
-                break;
-            }
-        }
+    if (new URL(finalUrl).host !== 'place.sanoma.it' || finalRes.status >= 400) {
+        throw new Error(`Login failed: the login did not return to place.sanoma.it (${finalRes.status} ${finalUrl}).`);
     }
 
     return client;
