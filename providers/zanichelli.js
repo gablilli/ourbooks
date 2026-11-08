@@ -1177,54 +1177,87 @@ export async function run(options = {}) {
 		process.exit(1);
 	}); // we don't really care about the response, but apparently it's required to access the book list
 
+
 	let books = {};
 
-	let page = 1;
-	let notATeacher = false;
+	const addBook = (license) => {
+		const volume = license?.volume;
+		if (!volume?.ereader_url) return;
 
-	while (true) {
-		let response = await fetch(`https://api-catalogo.zanichelli.it/v3/dashboard/search?sort%5Bfield%5D=year_date&sort%5Bdirection%5D=desc&searchString&pageNumber=${page}&rows=100`, {
-			headers: { 'myz-token': dashboardCookies['myz_token'] },
-		}).catch((err) => {
-			console.log("Error: ", err);
-			process.exit(1);
+		const book = {
+			title: volume.opera?.title || volume.title || 'Titolo non disponibile',
+			ereader_url: volume.ereader_url,
+			isbns: Array.isArray(volume.isbns) ? volume.isbns : [],
+		};
+
+		const isbnCandidates = new Set([
+			volume.isbn,
+			...(Array.isArray(volume.isbns) ? volume.isbns : []),
+		].filter(Boolean).map((value) => String(value).replace(/[^0-9Xx]/g, '')));
+
+		try {
+			const readerIsbn = new URL(volume.ereader_url).pathname.split('/').filter(Boolean).pop();
+			if (readerIsbn) isbnCandidates.add(String(readerIsbn).replace(/[^0-9Xx]/g, ''));
+		} catch {}
+
+		for (const isbn of isbnCandidates) {
+			if (isbn) books[isbn] = book;
+		}
+	};
+
+	const dashboardHeaders = { 'myz-token': dashboardCookies['myz_token'] };
+
+	console.log("Fetching real book licenses...");
+
+	try {
+		const realResponse = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/licenses/real', {
+			headers: dashboardHeaders,
 		});
-		if (response.status == 403) {
-			notATeacher = true;
-			break;
+
+		if (realResponse.ok) {
+			const realData = await realResponse.json();
+			for (const license of realData.realLicenses || []) addBook(license);
+		} else {
+			console.warn(`licenses/real returned HTTP ${realResponse.status}`);
 		}
-		response = await response.json();
-		if (!response.data || response.data.pagination.pages == 0) {
-			console.log("No books found");
-			process.exit(0);
-		}
-		for (let license of response.data.licenses || []) {
-			if (license.volume.ereader_url == '') continue;
-			books[license.volume.isbn] = {
-				title: license.volume.opera.title,
-				ereader_url: license.volume.ereader_url,
-				isbns: license.volume.isbns,
-			}
-		}
-		if (response.data.pagination.pages == page) break;
-		page++;
+	} catch (err) {
+		console.warn("Unable to fetch real licenses:", err.message);
 	}
 
-	if (notATeacher) {
-		let request = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/licenses/real', {
-			headers: { 'myz-token': dashboardCookies['myz_token'] },
-		}).then((res) => res.json()).catch((err) => {
-			console.log("Error: ", err);
-			process.exit(1);
-		});
-		for (let license of (request.realLicenses || [])) {
-			if (license.volume.ereader_url == '') continue;
-			books[license.volume.isbn] = {
-				title: license.volume.opera.title,
-				ereader_url: license.volume.ereader_url,
-				isbns: license.volume.isbns
+	let page = 1;
+	let searchPages = 1;
+
+	while (page <= searchPages) {
+		try {
+			const response = await fetch(
+				`https://api-catalogo.zanichelli.it/v3/dashboard/search?sort%5Bfield%5D=year_date&sort%5Bdirection%5D=desc&searchString&pageNumber=${page}&rows=100`,
+				{ headers: dashboardHeaders }
+			);
+
+			if (response.status === 403) break;
+			if (!response.ok) {
+				console.warn(`dashboard/search returned HTTP ${response.status}`);
+				break;
 			}
+
+			const data = await response.json();
+			const pagination = data?.data?.pagination;
+			if (!pagination || !Array.isArray(data.data.licenses)) break;
+
+			searchPages = Number(pagination.pages) || 0;
+			for (const license of data.data.licenses) addBook(license);
+			page++;
+		} catch (err) {
+			console.warn("Unable to fetch dashboard search results:", err.message);
+			break;
 		}
+	}
+
+	if (Object.keys(books).length === 0) {
+		console.error("No downloadable books found.");
+		console.error("The account was authenticated, but both Zanichelli library endpoints returned no usable licenses.");
+		console.error("Check the myz-token and the responses from /v3/dashboard/licenses/real and /v3/dashboard/search.");
+		process.exit(1);
 	}
 
 	console.log("Available books:");
@@ -1234,10 +1267,22 @@ export async function run(options = {}) {
 
 	while (!isbn)
 		isbn = prompt("ISBN: ");
+
+	isbn = String(isbn).replace(/[^0-9Xx]/g, '');
+	const selectedBook = books[isbn];
+
+	if (!selectedBook) {
+		console.error(`ISBN ${isbn} not found in your downloadable books.`);
+		console.log("Available ISBNs:");
+		for (const [availableIsbn, book] of Object.entries(books)) {
+			console.log(`${availableIsbn} - ${book.title}`);
+		}
+		process.exit(1);
+	}
 	
 	console.log("Detecting reader...");
 
-	let bookReaderUrl = await fetch(books[isbn].ereader_url, {
+	let bookReaderUrl = await fetch(selectedBook.ereader_url, {
 		headers: { cookie },
 		redirect: 'manual',
 	}).then((res) => res.headers.get('location')).catch((err) => {
@@ -1249,7 +1294,7 @@ export async function run(options = {}) {
 
 	if (bookReaderUrl.host == 'web-booktab.zanichelli.it') {
 		console.log("BookTab book detected");
-		await downloadBookTabBook(books[isbn].ereader_url, cookie, doOcr, outputDir);
+		await downloadBookTabBook(selectedBook.ereader_url, cookie, doOcr, outputDir);
 	} else {
 		console.log("Kitaboo book detected");
 		await downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCookieHeader);
