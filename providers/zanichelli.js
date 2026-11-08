@@ -9,7 +9,6 @@ import path from "path";
 import aesjs from "aes-js";
 import forge from "node-forge";
 import yargs from "yargs";
-import { spawn } from "child_process";
 import ZipStream from "zip-stream";
 
 const prompt = PromptSync({ sigint: true });
@@ -17,6 +16,13 @@ const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const WEBREADER_REFERER = "https://webreader.zanichelli.it/6.0/zanichelli/";
 const KITABOO_PREFETCH_WINDOW = 16; // depends on where u run it
 const KITABOO_FETCH_RETRIES = 3;
+
+const CATALOG_BASE = {
+	"User-Agent": USER_AGENT,
+	"Accept": "application/json",
+	"Origin": "https://my.zanichelli.it",
+	"Referer": "https://my.zanichelli.it/",
+};
 
 const argv = yargs(process.argv.slice(2))
 	.option("username", {
@@ -39,11 +45,6 @@ const argv = yargs(process.argv.slice(2))
 		type: "string",
 		description: "Overwrite the booktab ISBN (which is different from the normal ISBN)",
 	})
-	.option("ocr", {
-		type: "string",
-		description: "Run OCR on output (on/off)",
-		default: null,
-	})
 	.help()
 	.alias("help", "h")
 	.argv;
@@ -52,31 +53,13 @@ PDFDocument.prototype.addSVG = function (svg, x, y, options) {
 	return SVGtoPDF(this, svg, x, y, options), this;
 };
 
-function runOCR(inputPdf, outputPdf) {
-	return new Promise((resolve, reject) => {
-		console.log(`OCR: converting "${inputPdf}" to "${outputPdf}"...`);
-		const ocr = spawn('ocrmypdf', [inputPdf, outputPdf], { stdio: 'inherit' });
-		ocr.on('close', (code) => {
-			if (code === 0) {
-				console.log("OCR completed successfully");
-				resolve();
-			}
-			else reject(`OCRmyPDF exited with code ${code}`);
-		});
-		ocr.on('error', (err) => {
-			console.error("Failed to start OCR process:", err.message);
-			reject(err);
-		});
-	});
-}
-
 async function decryptFile(encryptionKey, encryptedData) {
 	let key = Buffer.from(encryptionKey, "utf8").slice(0, 16);
 	const aesCtr = new aesjs.ModeOfOperation.cbc(key, key);
 	let decryptedBytes = aesCtr.decrypt(Buffer.from(encryptedData, "base64"));
-	for(let i=16;i>0;i--){
-		if (decryptedBytes.slice(decryptedBytes.length-i).every(e=>e==i)) {
-			decryptedBytes = decryptedBytes.slice(0, decryptedBytes.length-i);
+	for (let i = 16; i > 0; i--) {
+		if (decryptedBytes.slice(decryptedBytes.length - i).every(e => e == i)) {
+			decryptedBytes = decryptedBytes.slice(0, decryptedBytes.length - i);
 			break;
 		}
 	}
@@ -437,8 +420,8 @@ async function loadKitabooTextPages(usertoken, textBookId, sessionCookies = '', 
 	let pageList = null;
 	let pageManifest = [];
 
-	// lol pages.json and page-list.json
 	for (const mode of modeCandidates) {
+		// lol pages.json and page-list.json
 		const pagesResponse = await fetch(`https://webreader.zanichelli.it/${textBookId}/${mode}/${textBookId}/OPS/pages.json`, {
 			headers: requestHeaders,
 		});
@@ -605,7 +588,7 @@ function drawInvisibleTextLayer(doc, textPage) {
 	doc.restore();
 }
 
-async function downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCookies = '') {
+async function downloadKitabooBook(bookReaderUrl, outputDir, sessionCookies = '') {
 	bookReaderUrl = new URL(bookReaderUrl.hash.substring(1), 'https://webreader.zanichelli.it');
 
 	let bookID = bookReaderUrl.searchParams.get('bookID');
@@ -614,22 +597,22 @@ async function downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCooki
 	console.log("Exchangin usertoken...");
 
 	usertoken = await fetch(`https://microservices.kitaboo.eu/v1/zanichelli/user/123/pc/validateUserToken?usertoken=${encodeURIComponent(usertoken)}`, {
-		headers: { 
+		headers: {
 			"User-Agent": USER_AGENT,
 		},
 	}).then(res => res.json()).then(res => res.userToken).catch((err) => {
 		console.log("Error: ", err);
 		process.exit(1);
 	});
-	
+
 	console.log("Fetching book details...");
 
 	let bookDetails = await fetch(`https://zanichelliservices.kitaboo.eu/DistributionServices/services/api/reader/distribution/123/pc/book/details?bookID=${bookID}&t=${Date.now()}`, {
-		headers: { 
+		headers: {
 			"User-Agent": USER_AGENT,
 			usertoken,
 			cookie: `usertoken=${usertoken}`,
-		}, // wtf is this mess?
+		},
 	}).then((res) => res.json()).catch((err) => {
 		console.log("Error: ", err);
 		process.exit(1);
@@ -668,13 +651,13 @@ async function downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCooki
 	if (bookDetails.bookList[0].book.assetType == "BOOK") {
 		console.log("Detected standard book, downloading as PDF");
 
-		console.log("Fetching encrypted encryption key...")
+		console.log("Fetching encrypted encryption key...");
 
 		let encryptedEncryptionKey = await fetch(`https://webreader.zanichelli.it/${ebookID}/html5/${ebookID}/OPS/enc_resource.key`, {
 			headers: {
-				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+				"User-Agent": USER_AGENT,
 				"Referer": "https://webreader.zanichelli.it/",
-				authorization: jwtToken, 
+				authorization: jwtToken,
 				cookie: readerCookies
 			},
 		}).then((res) => res.text()).catch((err) => {
@@ -683,7 +666,7 @@ async function downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCooki
 		});
 
 		console.log("Processing...");
-		
+
 		console.log("Decrypting encryption key...");
 
 		let privateKey = "-----BEGIN RSA PRIVATE KEY-----\n";
@@ -695,153 +678,137 @@ async function downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCooki
 
 		console.log("Fetching book content...");
 
-		let content = await fetch(`https://webreader.zanichelli.it/${ebookID}/html5/${ebookID}/OPS/content.opf`, { 
+		let content = await fetch(`https://webreader.zanichelli.it/${ebookID}/html5/${ebookID}/OPS/content.opf`, {
 			headers: {
-				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+				"User-Agent": USER_AGENT,
 				"Referer": "https://webreader.zanichelli.it/",
-				cookie: readerCookies 
+				cookie: readerCookies
 			}
 		}).then((res) => res.text()).then(parseString).catch((err) => {
 			console.log("Error: ", err);
 			process.exit(1);
 		});
 
-		// mention in content.metadata of render type, could be usefull in the future if other formats get added
-
 		if (content.Error) {
 			console.log("Error: ", ...content.Error.Code, ...content.Error.Message);
 			process.exit(1);
 		}
 
-			let title = content.package.metadata[0]["dc:title"][0];
+		let title = content.package.metadata[0]["dc:title"][0];
 
-			let items = {};
+		let items = {};
 
-			for (let item of content.package.manifest[0].item) {
-				if (['image/svg+xml', 'image/png', 'image/jpeg'].includes(item.$['media-type'])) items[item.$.id] = item.$.href;
+		for (let item of content.package.manifest[0].item) {
+			if (['image/svg+xml', 'image/png', 'image/jpeg'].includes(item.$['media-type'])) items[item.$.id] = item.$.href;
+		}
+
+		let textPages = [];
+		let pageManifestByImage = new Map();
+		try {
+			console.log("Fetching selectable text layer...");
+			const textLayer = await loadKitabooTextPages(usertoken, textBookId, sessionCookies, readerCookies, jwtToken);
+			textPages = textLayer.pages;
+			pageManifestByImage = textLayer.pageManifestByImage;
+			console.log(`Loaded text for ${textPages.length} pages`);
+		} catch (err) {
+			console.warn("Unable to load selectable text layer:", err.message);
+		}
+
+		const textPagesById = new Map(textPages.map((page) => [page.pageId, page]));
+
+		const pdfPath = path.join(outputDir, title.replace(/[^a-z0-9]/gi, '_') + '.pdf');
+		const doc = new PDFDocument({ autoFirstPage: false, margin: 0 });
+		const writeStream = fs.createWriteStream(pdfPath);
+		doc.pipe(writeStream);
+		const pageItemrefs = content.package.spine[0].itemref;
+		const pageTasks = pageItemrefs.map((itemref) => createKitabooPageAssetTask(itemref, items, ebookID, readerCookies, encryptionKey));
+		const pendingPageTasks = new Map();
+		let nextTaskIndex = 0;
+
+		const schedulePageTasks = () => {
+			while (nextTaskIndex < pageTasks.length && pendingPageTasks.size < KITABOO_PREFETCH_WINDOW) {
+				pendingPageTasks.set(nextTaskIndex, pageTasks[nextTaskIndex]());
+				nextTaskIndex++;
+			}
+		};
+
+		schedulePageTasks();
+
+		for (let index = 0; index < pageItemrefs.length; index++) {
+			const itemref = pageItemrefs[index];
+			if (shouldLogKitabooProgress(index, pageItemrefs.length)) {
+				console.log(`Downloading page ${index + 1}/${pageItemrefs.length}`);
 			}
 
-			let textPages = [];
-			let pageManifestByImage = new Map();
-			try {
-				console.log("Fetching selectable text layer...");
-				const textLayer = await loadKitabooTextPages(usertoken, textBookId, sessionCookies, readerCookies, jwtToken);
-				textPages = textLayer.pages;
-				pageManifestByImage = textLayer.pageManifestByImage;
-				console.log(`Loaded text for ${textPages.length} pages`);
-			} catch (err) {
-				console.warn("Unable to load selectable text layer:", err.message);
-			}
-
-			const textPagesById = new Map(textPages.map((page) => [page.pageId, page]));
-
-			const pdfPath = path.join(outputDir, title.replace(/[^a-z0-9]/gi, '_') + '.pdf');
-			const doc = new PDFDocument({ autoFirstPage: false, margin: 0 });
-			const writeStream = fs.createWriteStream(pdfPath);
-			doc.pipe(writeStream);
-			const pageItemrefs = content.package.spine[0].itemref;
-			const pageTasks = pageItemrefs.map((itemref) => createKitabooPageAssetTask(itemref, items, ebookID, readerCookies, encryptionKey));
-			const pendingPageTasks = new Map();
-			let nextTaskIndex = 0;
-
-			const schedulePageTasks = () => {
-				while (nextTaskIndex < pageTasks.length && pendingPageTasks.size < KITABOO_PREFETCH_WINDOW) {
-					pendingPageTasks.set(nextTaskIndex, pageTasks[nextTaskIndex]());
-					nextTaskIndex++;
-				}
-			};
-
+			const pageAsset = await pendingPageTasks.get(index);
+			pendingPageTasks.delete(index);
 			schedulePageTasks();
 
-			for (let index = 0; index < pageItemrefs.length; index++) {
-				const itemref = pageItemrefs[index];
-				if (shouldLogKitabooProgress(index, pageItemrefs.length)) {
-					console.log(`Downloading page ${index + 1}/${pageItemrefs.length}`);
-				}
+			let pageSize = null;
+			const imageName = pageAsset.imageName;
 
-				const pageAsset = await pendingPageTasks.get(index);
-				pendingPageTasks.delete(index);
-				schedulePageTasks();
-
-				let pageSize = null;
-				const imageName = pageAsset.imageName;
-
-				if (pageAsset.kind === 'svg') {
-					pageSize = pageManifestByImage.get(imageName) || pageAsset.fallbackPageSize || { width: 612, height: 792 };
-					pageSize = { width: pageSize.width, height: pageSize.height };
-					doc.addPage({ size: [pageSize.width, pageSize.height], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
-					doc.addSVG(pageAsset.payload, 0, 0, { width: pageSize.width, height: pageSize.height, preserveAspectRatio: "none" });
-				} else if (pageAsset.kind === 'png') {
-					const pngImage = doc.openImage(pageAsset.payload);
-					const manifestPage = pageManifestByImage.get(imageName);
-					pageSize = manifestPage ? { width: manifestPage.width, height: manifestPage.height } : { width: pngImage.width, height: pngImage.height };
-					doc.addPage({ size: [pageSize.width, pageSize.height], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
-					doc.image(pngImage, 0, 0, { width: pageSize.width, height: pageSize.height });
-				} else if (pageAsset.kind === 'jpg') {
-					const jpegImage = doc.openImage(pageAsset.payload);
-					const manifestPage = pageManifestByImage.get(imageName);
-					pageSize = manifestPage ? { width: manifestPage.width, height: manifestPage.height } : { width: jpegImage.width, height: jpegImage.height };
-					doc.addPage({ size: [pageSize.width, pageSize.height], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
-					doc.image(jpegImage, 0, 0, { width: pageSize.width, height: pageSize.height });
-				}
-
-				const candidatePageIds = (String(itemref.$.idref).match(/\d+/g) || []).map((value) => normalizePageId(value));
-				const manifestPage = imageName ? pageManifestByImage.get(imageName) : null;
-				const textPage = [
-					manifestPage?.pageId ? textPagesById.get(manifestPage.pageId) : null,
-					...candidatePageIds.map((pageId) => textPagesById.get(pageId)),
-				].find(Boolean);
-				if (textPage) {
-					drawInvisibleTextLayer(doc, textPage);
-				}
+			if (pageAsset.kind === 'svg') {
+				pageSize = pageManifestByImage.get(imageName) || pageAsset.fallbackPageSize || { width: 612, height: 792 };
+				pageSize = { width: pageSize.width, height: pageSize.height };
+				doc.addPage({ size: [pageSize.width, pageSize.height], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
+				doc.addSVG(pageAsset.payload, 0, 0, { width: pageSize.width, height: pageSize.height, preserveAspectRatio: "none" });
+			} else if (pageAsset.kind === 'png') {
+				const pngImage = doc.openImage(pageAsset.payload);
+				const manifestPage = pageManifestByImage.get(imageName);
+				pageSize = manifestPage ? { width: manifestPage.width, height: manifestPage.height } : { width: pngImage.width, height: pngImage.height };
+				doc.addPage({ size: [pageSize.width, pageSize.height], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
+				doc.image(pngImage, 0, 0, { width: pageSize.width, height: pageSize.height });
+			} else if (pageAsset.kind === 'jpg') {
+				const jpegImage = doc.openImage(pageAsset.payload);
+				const manifestPage = pageManifestByImage.get(imageName);
+				pageSize = manifestPage ? { width: manifestPage.width, height: manifestPage.height } : { width: jpegImage.width, height: jpegImage.height };
+				doc.addPage({ size: [pageSize.width, pageSize.height], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
+				doc.image(jpegImage, 0, 0, { width: pageSize.width, height: pageSize.height });
 			}
 
-			doc.end();
-
-			await new Promise((resolve, reject) => {
-				writeStream.on('finish', resolve);
-				writeStream.on('error', reject);
-			});
-
-			let fileExists = false;
-			for (let i = 0; i < 50; i++) {
-				try {
-					const stats = await fs.promises.stat(pdfPath);
-					if (stats.size > 0) {
-						fileExists = true;
-						break;
-					}
-				} catch (e) {}
-				await new Promise(resolve => setTimeout(resolve, 200));
+			const candidatePageIds = (String(itemref.$.idref).match(/\d+/g) || []).map((value) => normalizePageId(value));
+			const manifestPage = imageName ? pageManifestByImage.get(imageName) : null;
+			const textPage = [
+				manifestPage?.pageId ? textPagesById.get(manifestPage.pageId) : null,
+				...candidatePageIds.map((pageId) => textPagesById.get(pageId)),
+			].find(Boolean);
+			if (textPage) {
+				drawInvisibleTextLayer(doc, textPage);
 			}
+		}
 
-			if (!fileExists) {
-				console.error('PDF file was not created');
-				console.error('Expected file: ' + pdfPath);
-				console.error('Current directory: ' + process.cwd());
-				process.exit(1);
-			}
+		doc.end();
 
-			if (doOcr) {
-				console.log("Running OCR on output...");
-				try {
-					const ocrPath = path.join(outputDir, 'ocr_' + path.basename(pdfPath));
-					await runOCR(pdfPath, ocrPath);
-					console.log("Done! PDF with selectable text: " + ocrPath);
-					console.log(`OURBOOKS_OUTPUT:${ocrPath}`);
-				} catch (err) {
-					console.error("OCR error:", err.message);
-					console.error("The PDF was saved without OCR as: " + pdfPath);
-					console.log(`OURBOOKS_OUTPUT:${pdfPath}`);
+		await new Promise((resolve, reject) => {
+			writeStream.on('finish', resolve);
+			writeStream.on('error', reject);
+		});
+
+		let fileExists = false;
+		for (let i = 0; i < 50; i++) {
+			try {
+				const stats = await fs.promises.stat(pdfPath);
+				if (stats.size > 0) {
+					fileExists = true;
+					break;
 				}
-			} else {
-				console.log("Done! PDF saved: " + pdfPath);
-				console.log(`OURBOOKS_OUTPUT:${pdfPath}`);
-			}
+			} catch (e) {}
+			await new Promise(resolve => setTimeout(resolve, 200));
+		}
+
+		if (!fileExists) {
+			console.error('PDF file was not created');
+			console.error('Expected file: ' + pdfPath);
+			console.error('Current directory: ' + process.cwd());
+			process.exit(1);
+		}
+
+		console.log("Done! PDF saved: " + pdfPath);
+		console.log(`OURBOOKS_OUTPUT:${pdfPath}`);
 	} else if (bookDetails.bookList[0].book.assetType == "EPUB") {
 		console.log("Detected liquid book, downloading as EPUB");
 
-		const archive = new ZipStream({store: true});
+		const archive = new ZipStream({ store: true });
 
 		archive.on("error", function (err) {
 			throw err;
@@ -862,14 +829,14 @@ async function downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCooki
 		archive.pipe(fs.createWriteStream(epubPath));
 
 		console.log("Fetching container file");
-		
-		const rootUrl = `https://webreader.zanichelli.it/${ebookID}/fixed_epub_image/${ebookID}/`
 
-		const containerFile = await fetch(rootUrl + "META-INF/container.xml", { 
+		const rootUrl = `https://webreader.zanichelli.it/${ebookID}/fixed_epub_image/${ebookID}/`;
+
+		const containerFile = await fetch(rootUrl + "META-INF/container.xml", {
 			headers: {
-				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+				"User-Agent": USER_AGENT,
 				"Referer": "https://webreader.zanichelli.it/",
-				cookie: readerCookies 
+				cookie: readerCookies
 			}
 		}).then((res) => res.text()).catch((err) => {
 			console.log("Error: ", err);
@@ -883,11 +850,11 @@ async function downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCooki
 
 		console.log("Fetching root file");
 
-		const rootFile = await fetch(rootUrl + rootFileUrl, { 
+		const rootFile = await fetch(rootUrl + rootFileUrl, {
 			headers: {
-				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+				"User-Agent": USER_AGENT,
 				"Referer": "https://webreader.zanichelli.it/",
-				cookie: readerCookies 
+				cookie: readerCookies
 			}
 		}).then((res) => res.text()).catch((err) => {
 			console.log("Error: ", err);
@@ -901,14 +868,14 @@ async function downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCooki
 		const prefix = path.dirname(rootFileUrl) + '/';
 
 		for (let i = 0; i < parsedRootFile.package.manifest[0].item.length; i++) {
-			console.log(`Fetching content ${i+1}/${parsedRootFile.package.manifest[0].item.length}`);
+			console.log(`Fetching content ${i + 1}/${parsedRootFile.package.manifest[0].item.length}`);
 
 			const fileEntry = parsedRootFile.package.manifest[0].item[i];
-			const file = await fetch(rootUrl + prefix + fileEntry.$['href'], { 
+			const file = await fetch(rootUrl + prefix + fileEntry.$['href'], {
 				headers: {
-					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+					"User-Agent": USER_AGENT,
 					"Referer": "https://webreader.zanichelli.it/",
-					cookie: readerCookies 
+					cookie: readerCookies
 				}
 			}).then(res => {
 				if (!res.ok) throw res;
@@ -931,8 +898,7 @@ async function downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCooki
 	}
 }
 
-async function downloadBookTabBook(redirectUrl, cookie, doOcr, outputDir) { // bookReaderUrl, 
-	//let idOpera = bookReaderUrl.searchParams.get('idOpera');
+async function downloadBookTabBook(redirectUrl, cookie, outputDir) {
 	let isbn = redirectUrl.split('/');
 	isbn = argv["booktab-isbn"] || isbn[isbn.length - 1];
 
@@ -947,21 +913,6 @@ async function downloadBookTabBook(redirectUrl, cookie, doOcr, outputDir) { // b
 	});
 
 	cookie += `; booktab_token=${bookTabSession.session}`;
-
-	/*console.log("Fetching available books...");
-
-	let bookTabBooks = await fetch('https://web-booktab.zanichelli.it/api/v5/metadata', {
-		headers: { cookie },
-	}).then((res) => res.json()).catch((err) => {
-		console.log("Error: ", err);
-		process.exit(1);
-	});
-
-	let candidates = bookTabBooks.books.filter((book) => book.idBookZ == idOpera);
-
-	console.log("Available books:"); // why is there a second list of books? I don't know, no idea, it just goes to show how shitty zanichelli's software is
-	console.table(candidates, ['title', 'idBookZ', 'isbn']);*/ // probably no longer needed
-
 
 	while (!isbn)
 		isbn = prompt("ISBN: ");
@@ -979,7 +930,7 @@ async function downloadBookTabBook(redirectUrl, cookie, doOcr, outputDir) { // b
 					console.log('Looks like this is not a downloadable book, try another one.');
 					process.exit(1);
 				}
-				return res.text()
+				return res.text();
 			});
 		}
 		return res.text();
@@ -1001,8 +952,8 @@ async function downloadBookTabBook(redirectUrl, cookie, doOcr, outputDir) { // b
 
 	let isXps = false;
 
-	for(let i = 0; i < units.length; i++) {
-		console.log(`Downloading unit ${i + 1} of ${units.length}`)
+	for (let i = 0; i < units.length; i++) {
+		console.log(`Downloading unit ${i + 1} of ${units.length}`);
 		const unit = units[i];
 		let config = await fetch(`https://web-booktab.zanichelli.it/api/v1/resources_web/${isbn}/${unit}/config.xml`, {
 			headers: { cookie },
@@ -1048,7 +999,7 @@ async function downloadBookTabBook(redirectUrl, cookie, doOcr, outputDir) { // b
 			continue;
 		}
 
-			pdf = await pdf.buffer();
+		pdf = await pdf.buffer();
 		await pdfMerger.add(pdf);
 	}
 
@@ -1063,7 +1014,7 @@ async function downloadBookTabBook(redirectUrl, cookie, doOcr, outputDir) { // b
 		console.log("Saving...");
 		const pdfPath = path.join(outputDir, title + '.pdf');
 		console.log("PDF path will be: " + pdfPath);
-		
+
 		try {
 			await pdfMerger.save(pdfPath);
 			console.log("pdfMerger.save() completed");
@@ -1071,53 +1022,115 @@ async function downloadBookTabBook(redirectUrl, cookie, doOcr, outputDir) { // b
 			console.error("Error during pdfMerger.save():", mergeErr.message);
 			process.exit(1);
 		}
-		
+
 		let fileExists = false;
 		for (let i = 0; i < 50; i++) {
 			try {
 				const stats = await fs.promises.stat(pdfPath);
-				console.log(`Check ${i+1}: File size = ${stats.size} bytes`);
+				console.log(`Check ${i + 1}: File size = ${stats.size} bytes`);
 				if (stats.size > 0) {
 					fileExists = true;
 					console.log("File found!");
 					break;
 				}
 			} catch (e) {
-				console.log(`Check ${i+1}: File not found yet`);
+				console.log(`Check ${i + 1}: File not found yet`);
 			}
 			await new Promise(resolve => setTimeout(resolve, 200));
 		}
-		
+
 		if (!fileExists) {
 			console.error('PDF file was not created');
 			console.error('Expected file: ' + pdfPath);
 			console.error('Current directory: ' + process.cwd());
 			process.exit(1);
 		}
-		
-			if (doOcr) {
-				console.log("Running OCR on output...");
-				try {
-					const ocrPath = path.join(outputDir, 'ocr_' + path.basename(pdfPath));
-					await runOCR(pdfPath, ocrPath);
-				console.log("Done! PDF with selectable text: " + ocrPath);
-				console.log(`OURBOOKS_OUTPUT:${ocrPath}`);
-			} catch (err) {
-				console.error("OCR error:", err.message);
-				console.error("The PDF was saved without OCR as: " + pdfPath);
-				console.log(`OURBOOKS_OUTPUT:${pdfPath}`);
-			}
-		} else {
-			console.log("Done! PDF saved: " + pdfPath);
-			console.log(`OURBOOKS_OUTPUT:${pdfPath}`);
-		}
+
+		console.log("Done! PDF saved: " + pdfPath);
+		console.log(`OURBOOKS_OUTPUT:${pdfPath}`);
 	}
+}
+
+function randomMyzToken(length = 11) {
+	const chars = 'abcdefghijklmnopqrstuvwxyz';
+	return Array.from({ length }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+}
+
+async function isMyzTokenValid(myzToken, idpToken) {
+	if (!myzToken) return false;
+	const res = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/user', {
+		headers: {
+			...CATALOG_BASE,
+			'myz-token': myzToken,
+			cookie: `token=${idpToken}; myz_token=${myzToken}`,
+		},
+	}).catch(() => null);
+	return !!res && res.ok;
+}
+
+async function callDashboardInit(idpToken, myzToken) {
+	const res = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/init', {
+		headers: {
+			...CATALOG_BASE,
+			'myz-token': myzToken,
+			authorization: `Bearer ${idpToken}`,
+			cookie: `token=${idpToken}` + (myzToken ? `; myz_token=${myzToken}` : ''),
+		},
+	}).catch(() => null);
+	if (!res || !res.ok) return null;
+	const json = await res.json().catch(() => null);
+	return json?.token || null;
+}
+
+async function getMyzToken(idpToken) {
+	const strategies = [
+		["init senza myz-token", () => callDashboardInit(idpToken, '')],
+		["init con token generato", async () => {
+			const generated = randomMyzToken();
+			return (await callDashboardInit(idpToken, generated)) || generated;
+		}],
+		["cookie da my.zanichelli.it", async () => {
+			const res = await fetch("https://my.zanichelli.it/?loginMode=myZanichelli", {
+				headers: { "User-Agent": USER_AGENT, cookie: `token=${idpToken}` },
+				redirect: 'manual',
+			});
+			const setCookie = getSetCookies(res).find((entry) => entry.startsWith('myz_token='));
+			return extractCookiePairs(setCookie).find(([key]) => key === 'myz_token')?.[1] || null;
+		}],
+	];
+
+	for (const [name, strategy] of strategies) {
+		try {
+			const candidate = await strategy();
+			if (await isMyzTokenValid(candidate, idpToken)) {
+				console.log(`myz-token ottenuto (${name})`);
+				return candidate;
+			}
+		} catch (err) {}
+	}
+
+	return null;
+}
+
+async function resolveReaderUrl(startUrl, cookie) {
+	let url = startUrl;
+	for (let hop = 0; hop < 8; hop++) {
+		const res = await fetch(url, {
+			headers: { "User-Agent": USER_AGENT, cookie },
+			redirect: 'manual',
+		});
+		const location = res.headers.get('location');
+		if (!location) break;
+		const next = new URL(location, url);
+		if (next.host === 'web-booktab.zanichelli.it' || next.host === 'webreader.zanichelli.it') return next;
+		url = next.toString();
+	}
+	throw new Error("Impossibile risolvere il reader del libro (nessun redirect verso booktab/webreader)");
 }
 
 export async function run(options = {}) {
 	let username = options.username || argv.username;
 	let password = options.password || argv.password;
-	const doOcr = (options.ocr || argv.ocr) === 'on';
 	const outputDir = process.env.OURBOOKS_OUTPUT_DIR || '.';
 
 	while (!username)
@@ -1132,166 +1145,83 @@ export async function run(options = {}) {
 		method: "POST",
 		headers: {
 			"content-type": "application/x-www-form-urlencoded",
-			"user-agent": USER_AGENT,
+			"Accept": "application/json",
+			"Origin": "https://my.zanichelli.it",
+			"Referer": "https://my.zanichelli.it/",
+			"User-Agent": USER_AGENT,
 		},
 		body: `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`,
+	}).catch((err) => {
+		console.log("Error: ", err);
+		process.exit(1);
 	});
 
-	const loginBody = await loginResponse.json().catch(() => ({}));
-	if (!loginResponse.ok || !loginBody.token) {
-		console.error(`Zanichelli login failed (HTTP ${loginResponse.status}).`);
-		console.error(loginBody.message || loginBody.error || "The login response did not contain a token.");
+	const loginJson = await loginResponse.json().catch(() => ({}));
+	const token = loginJson.token;
+
+	if (!token) {
+		console.log("Login fallito:", loginJson.message || loginResponse.status);
 		process.exit(1);
 	}
 
-	const idpCookie = `token=${loginBody.token}`;
-	const myzResponse = await fetch("https://my.zanichelli.it/?loginMode=myZanichelli", {
-		headers: { cookie: idpCookie, "user-agent": USER_AGENT },
-	});
+	const cookie = `token=${token}`;
 
-	if (!myzResponse.ok) {
-		console.error(`Unable to open myZanichelli (HTTP ${myzResponse.status}).`);
-		process.exit(1);
-	}
+	const myzToken = await getMyzToken(token);
 
-	const loginCookies = getSetCookies(myzResponse).map((value) => String(value).split(';')[0]);
-	const sessionCookieHeader = mergeCookieHeaders([idpCookie], loginCookies);
-	const cookieMap = new Map();
-	for (const [key, value] of extractCookiePairs(sessionCookieHeader)) {
-		cookieMap.set(key.toLowerCase(), value);
-	}
-
-	let myzToken = cookieMap.get('myz_token') || cookieMap.get('myz-token');
 	if (!myzToken) {
-		console.error("Login completed, but Zanichelli did not return the myz-token cookie.");
-		console.error("Cookie names received:", [...cookieMap.keys()].join(', ') || '(none)');
-		console.error("The session cannot access the book catalogue without this token.");
+		console.log("Impossibile ottenere il myz-token (il flusso di my.zanichelli.it potrebbe essere cambiato di nuovo)");
 		process.exit(1);
 	}
 
-	const dashboardHeaders = {
+	const catalogHeaders = {
+		...CATALOG_BASE,
 		'myz-token': myzToken,
-		'origin': 'https://my.zanichelli.it',
-		'referer': 'https://my.zanichelli.it/',
-		'user-agent': USER_AGENT,
+		cookie: `${cookie}; myz_token=${myzToken}`,
 	};
+	const sessionCookieHeader = mergeCookieHeaders([cookie], [`myz_token=${myzToken}`]);
 
-	console.log("Initializing Zanichelli dashboard session...");
-	const initResponse = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/init', {
-		headers: dashboardHeaders,
-	});
-	const initText = await initResponse.text();
-	if (!initResponse.ok && initResponse.status !== 204) {
-		console.error(`Dashboard initialization failed (HTTP ${initResponse.status}).`);
-		console.error(initText.slice(0, 500));
-		process.exit(1);
-	}
-	if (initText) {
-		try {
-			const initData = JSON.parse(initText);
-			if (initData.token) {
-				myzToken = initData.token;
-				dashboardHeaders['myz-token'] = myzToken;
-			}
-		} catch {}
-	}
-
-	const userResponse = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/user', {
-		headers: dashboardHeaders,
-	});
-	const userText = await userResponse.text();
-	if (!userResponse.ok) {
-		console.error(`Zanichelli dashboard authentication failed (HTTP ${userResponse.status}).`);
-		console.error(userText.slice(0, 500));
-		process.exit(1);
-	}
-	let userData = {};
-	try { userData = JSON.parse(userText); } catch {}
-	console.log(`Logged in as: ${userData.firstName || ''} ${userData.lastName || ''}`.trim());
 	console.log("Fetching available books...");
+
+	// we don't really care about the response, but apparently it's required to access the book list
+	await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/user', {
+		headers: catalogHeaders,
+	}).then(res => res.json()).then((res) => {
+		console.log(`Logged in as: ${res.firstName} ${res.lastName}`);
+	}).catch((err) => {
+		console.log("Error: ", err);
+		process.exit(1);
+	});
 
 	let books = {};
 
-	const addBook = (license) => {
-		const volume = license?.volume;
-		if (!volume?.ereader_url) return;
-
-		const book = {
-			title: volume.opera?.title || volume.title || 'Titolo non disponibile',
-			ereader_url: volume.ereader_url,
-			isbns: Array.isArray(volume.isbns) ? volume.isbns : [],
+	const addLicense = (license) => {
+		if (!license?.volume?.ereader_url) return;
+		books[license.volume.isbn] = {
+			title: license.volume.opera?.title || license.volume.title,
+			ereader_url: license.volume.ereader_url,
+			isbns: license.volume.isbns || [],
 		};
-
-		const isbnCandidates = new Set([
-			volume.isbn,
-			...(Array.isArray(volume.isbns) ? volume.isbns : []),
-		].filter(Boolean).map((value) => String(value).replace(/[^0-9Xx]/g, '')));
-
-		try {
-			const readerIsbn = new URL(volume.ereader_url).pathname.split('/').filter(Boolean).pop();
-			if (readerIsbn) isbnCandidates.add(String(readerIsbn).replace(/[^0-9Xx]/g, ''));
-		} catch {}
-
-		for (const isbn of isbnCandidates) {
-			if (isbn) books[isbn] = book;
-		}
 	};
 
-	console.log("Fetching real book licenses...");
-
-	try {
-		const realResponse = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/licenses/real', {
-			headers: dashboardHeaders,
-		});
-
-		const realText = await realResponse.text();
-		if (realResponse.ok) {
-			let realData = {};
-			try { realData = JSON.parse(realText); } catch {}
-			const licenses = realData.realLicenses || realData.data?.realLicenses || [];
-			console.log(`licenses/real: HTTP ${realResponse.status}, ${Array.isArray(licenses) ? licenses.length : 0} licenses received.`);
-			for (const license of (Array.isArray(licenses) ? licenses : Object.values(licenses))) addBook(license);
-		} else {
-			console.warn(`licenses/real returned HTTP ${realResponse.status}: ${realText.slice(0, 500)}`);
-		}
-	} catch (err) {
-		console.warn("Unable to fetch real licenses:", err.message);
+	for (let page = 1; ; page++) {
+		const response = await fetch(`https://api-catalogo.zanichelli.it/v3/dashboard/search?sort%5Bfield%5D=year_date&sort%5Bdirection%5D=desc&searchString&pageNumber=${page}&rows=100`, {
+			headers: catalogHeaders,
+		}).catch(() => null);
+		if (!response || !response.ok) break;
+		const json = await response.json().catch(() => null);
+		if (!json?.data) break;
+		(json.data.licenses || []).forEach(addLicense);
+		if (!json.data.pagination || json.data.pagination.pages <= page) break;
 	}
 
-	let page = 1;
-	let searchPages = 1;
+	const realLicenses = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/licenses/real', {
+		headers: catalogHeaders,
+	}).then((res) => res.json()).catch(() => ({}));
+	(realLicenses.realLicenses || []).forEach(addLicense);
 
-	while (page <= searchPages) {
-		try {
-			const response = await fetch(
-				`https://api-catalogo.zanichelli.it/v3/dashboard/search?sort%5Bfield%5D=year_date&sort%5Bdirection%5D=desc&searchString&pageNumber=${page}&rows=100`,
-				{ headers: dashboardHeaders }
-			);
-
-			if (response.status === 403) break;
-			if (!response.ok) {
-				console.warn(`dashboard/search returned HTTP ${response.status}`);
-				break;
-			}
-
-			const data = await response.json();
-			const pagination = data?.data?.pagination;
-			if (!pagination || !Array.isArray(data.data.licenses)) break;
-
-			searchPages = Number(pagination.pages) || 0;
-			for (const license of data.data.licenses) addBook(license);
-			page++;
-		} catch (err) {
-			console.warn("Unable to fetch dashboard search results:", err.message);
-			break;
-		}
-	}
-
-	if (Object.keys(books).length === 0) {
-		console.error("No downloadable books found.");
-		console.error("The account was authenticated, but both Zanichelli library endpoints returned no usable licenses.");
-		console.error("No usable license was returned. The HTTP status and response body above should identify whether this is authentication or a changed API response.");
-		process.exit(1);
+	if (!Object.keys(books).length) {
+		console.log("No books found");
+		process.exit(0);
 	}
 
 	console.log("Available books:");
@@ -1302,35 +1232,30 @@ export async function run(options = {}) {
 	while (!isbn)
 		isbn = prompt("ISBN: ");
 
-	isbn = String(isbn).replace(/[^0-9Xx]/g, '');
-	const selectedBook = books[isbn];
-
-	if (!selectedBook) {
-		console.error(`ISBN ${isbn} not found in your downloadable books.`);
-		console.log("Available ISBNs:");
-		for (const [availableIsbn, book] of Object.entries(books)) {
-			console.log(`${availableIsbn} - ${book.title}`);
+	if (!books[isbn]) {
+		const match = Object.keys(books).find((key) => books[key].isbns.includes(isbn));
+		if (!match) {
+			console.log("ISBN non trovato tra i tuoi libri");
+			process.exit(1);
 		}
-		process.exit(1);
+		isbn = match;
 	}
-	
+
 	console.log("Detecting reader...");
 
-	let bookReaderUrl = await fetch(selectedBook.ereader_url, {
-		headers: { cookie },
-		redirect: 'manual',
-	}).then((res) => res.headers.get('location')).catch((err) => {
-		console.log("Error: ", err);
+	let bookReaderUrl;
+	try {
+		bookReaderUrl = await resolveReaderUrl(books[isbn].ereader_url, catalogHeaders.cookie);
+	} catch (err) {
+		console.log("Error: ", err.message);
 		process.exit(1);
-	});
-
-	bookReaderUrl = new URL(bookReaderUrl);
+	}
 
 	if (bookReaderUrl.host == 'web-booktab.zanichelli.it') {
 		console.log("BookTab book detected");
-		await downloadBookTabBook(selectedBook.ereader_url, cookie, doOcr, outputDir);
+		await downloadBookTabBook(books[isbn].ereader_url, cookie, outputDir);
 	} else {
 		console.log("Kitaboo book detected");
-		await downloadKitabooBook(bookReaderUrl, doOcr, outputDir, sessionCookieHeader);
+		await downloadKitabooBook(bookReaderUrl, outputDir, sessionCookieHeader);
 	}
 }
