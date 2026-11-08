@@ -14,9 +14,6 @@ ui pulita e cli per scaricare i tuoi libri digitali dalle piattaforme degli edit
 
 - node.js 20 o superiore
 - npm
-- strumenti esterni, necessari solo per alcuni provider:
-  - pdftk, usato da bsmart e laterza per unire le pagine in un unico pdf (in alternativa a pdfunite, incluso in poppler-utils)
-  - ocrmypdf, usato da zanichelli solo se attivi l'opzione ocr
 
 se usi docker trovi già pdftk e java nell'immagine, ma non ocrmypdf, quindi l'ocr di zanichelli non è disponibile nel container.
 
