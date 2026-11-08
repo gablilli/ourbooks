@@ -11,6 +11,8 @@ import {
   loginSanoma,
   getBookCatalog
 } from './providers/src/sanoma/auth.js';
+import { createSession } from './providers/src/zanichelli/login.js';
+import { getUser, listBooks } from './providers/src/zanichelli/catalog.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -494,84 +496,14 @@ app.post('/api/zanichelli-books', async (req, res) => {
   }
 
   try {
-    const loginRes = await fetch("https://idp.zanichelli.it/v4/login/", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`,
+    const session = await createSession(username, password);
+    await getUser(session);
+    const books = await listBooks(session);
+    res.status(200).json({
+      books: Object.entries(books).map(([isbn, b]) => ({ isbn, title: b.title })),
     });
-    
-    if (!loginRes.ok) {
-        return res.status(401).json({ error: 'Login fallito: credenziali non valide' });
-    }
-
-    const loginData = await loginRes.json();
-    const token = loginData.token;
-    if (!token) {
-        return res.status(401).json({ error: 'Login fallito: token mancante' });
-    }
-
-    const cookie = `token=${token}`;
-    const myZanichelliRes = await fetch("https://my.zanichelli.it/?loginMode=myZanichelli", {
-      headers: { cookie },
-    });
-    
-    const setCookieHeader = (myZanichelliRes.headers.raw ? myZanichelliRes.headers.raw()['set-cookie'] : myZanichelliRes.headers.getSetCookie()) || [];
-    const loginCookies = setCookieHeader.map(c => c.split(';')[0]);
-    const dashboardCookies = {};
-    for (let c of loginCookies) {
-      const [key, value] = c.split('=');
-      dashboardCookies[key] = value;
-    }
-
-    await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/user', {
-      headers: { 'myz-token': dashboardCookies['myz_token'] },
-    });
-
-    let returnBooks = [];
-    let page = 1;
-    let notATeacher = false;
-
-    while (true) {
-      let r = await fetch(`https://api-catalogo.zanichelli.it/v3/dashboard/search?sort%5Bfield%5D=year_date&sort%5Bdirection%5D=desc&searchString&pageNumber=${page}&rows=100`, {
-        headers: { 'myz-token': dashboardCookies['myz_token'] },
-      });
-      if (r.status == 403) {
-        notATeacher = true;
-        break;
-      }
-      const pData = await r.json();
-      if (!pData.data || pData.data.pagination.pages == 0) break;
-
-      for (let license of pData.data.licenses || []) {
-        if (license.volume.ereader_url == '') continue;
-        returnBooks.push({
-            isbn: license.volume.isbn,
-            title: license.volume.opera.title
-        });
-      }
-      if (pData.data.pagination.pages == page) break;
-      page++;
-    }
-
-    if (notATeacher) {
-      let request = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/licenses/real', {
-        headers: { 'myz-token': dashboardCookies['myz_token'] },
-      });
-      if (request.ok) {
-          const resData = await request.json();
-          for (let license of resData.realLicenses || []) {
-            if (license.volume.ereader_url == '') continue;
-            returnBooks.push({
-                isbn: license.volume.isbn,
-                title: license.volume.opera.title
-            });
-          }
-      }
-    }
-
-    res.status(200).json({ books: returnBooks });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
