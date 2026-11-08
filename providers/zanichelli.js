@@ -1051,62 +1051,83 @@ async function downloadBookTabBook(redirectUrl, cookie, outputDir) {
 	}
 }
 
-function randomMyzToken(length = 11) {
-	const chars = 'abcdefghijklmnopqrstuvwxyz';
-	return Array.from({ length }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+/*
+ * ---------------------------------------------------------------------------
+ * myz-token handling (FIXED)
+ *
+ * From the browser HAR: after the IdP login, the browser does
+ *   GET https://my.zanichelli.it/dashboard   (cookie: token=<idp jwt>)
+ * and the response sets  `myz_token=<11 lowercase letters>; domain=zanichelli.it`.
+ * That token is generated and bound to the user SERVER-SIDE. The front-end then
+ * sends it as the `myz-token` header (no cookie, no Authorization) to
+ * api-catalogo.zanichelli.it (init, user, licenses/real, ...).
+ *
+ * A self-generated random token is never bound to the user, so it can't work.
+ * ---------------------------------------------------------------------------
+ */
+
+const DEBUG = !!process.env.OURBOOKS_DEBUG;
+
+function debugLog(...args) {
+	if (DEBUG) console.log("[debug]", ...args);
 }
 
+// Valid only if licenses/real answers 200 with a { realLicenses: [...] } array
 async function isMyzTokenValid(myzToken, idpToken) {
 	if (!myzToken) return false;
-	const res = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/user', {
+	const res = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/licenses/real', {
 		headers: {
 			...CATALOG_BASE,
 			'myz-token': myzToken,
 			cookie: `token=${idpToken}; myz_token=${myzToken}`,
 		},
-	}).catch(() => null);
-	return !!res && res.ok;
+	}).catch((err) => {
+		debugLog("licenses/real request failed:", err.message);
+		return null;
+	});
+	if (!res) return false;
+	if (!res.ok) {
+		debugLog("licenses/real status", res.status, (await res.text().catch(() => '')).slice(0, 200));
+		return false;
+	}
+	const json = await res.json().catch(() => null);
+	return Array.isArray(json?.realLicenses);
 }
 
-async function callDashboardInit(idpToken, myzToken) {
-	const res = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/init', {
+async function getMyzTokenFromPage(url, idpToken) {
+	const res = await fetch(url, {
 		headers: {
-			...CATALOG_BASE,
-			'myz-token': myzToken,
-			authorization: `Bearer ${idpToken}`,
-			cookie: `token=${idpToken}` + (myzToken ? `; myz_token=${myzToken}` : ''),
+			"User-Agent": USER_AGENT,
+			"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+			"Referer": "https://my.zanichelli.it/",
+			cookie: `token=${idpToken}`,
 		},
-	}).catch(() => null);
-	if (!res || !res.ok) return null;
-	const json = await res.json().catch(() => null);
-	return json?.token || null;
+		redirect: 'manual',
+	});
+	debugLog(`GET ${url} ->`, res.status, res.headers.get('location') || '');
+	const setCookie = getSetCookies(res).find((entry) => entry.startsWith('myz_token='));
+	return extractCookiePairs(setCookie).find(([key]) => key === 'myz_token')?.[1] || null;
 }
 
 async function getMyzToken(idpToken) {
 	const strategies = [
-		["init senza myz-token", () => callDashboardInit(idpToken, '')],
-		["init con token generato", async () => {
-			const generated = randomMyzToken();
-			return (await callDashboardInit(idpToken, generated)) || generated;
-		}],
-		["cookie da my.zanichelli.it", async () => {
-			const res = await fetch("https://my.zanichelli.it/?loginMode=myZanichelli", {
-				headers: { "User-Agent": USER_AGENT, cookie: `token=${idpToken}` },
-				redirect: 'manual',
-			});
-			const setCookie = getSetCookies(res).find((entry) => entry.startsWith('myz_token='));
-			return extractCookiePairs(setCookie).find(([key]) => key === 'myz_token')?.[1] || null;
-		}],
+		// This is what the browser does (confirmed by HAR).
+		["cookie da my.zanichelli.it/dashboard", () => getMyzTokenFromPage("https://my.zanichelli.it/dashboard", idpToken)],
+		// Older flow, kept as fallback.
+		["cookie da my.zanichelli.it/?loginMode", () => getMyzTokenFromPage("https://my.zanichelli.it/?loginMode=myZanichelli", idpToken)],
 	];
 
 	for (const [name, strategy] of strategies) {
 		try {
 			const candidate = await strategy();
+			debugLog(`strategy "${name}" ->`, candidate || "no token");
 			if (await isMyzTokenValid(candidate, idpToken)) {
 				console.log(`myz-token ottenuto (${name})`);
 				return candidate;
 			}
-		} catch (err) {}
+		} catch (err) {
+			debugLog(`strategy "${name}" failed:`, err.message);
+		}
 	}
 
 	return null;
@@ -1120,6 +1141,7 @@ async function resolveReaderUrl(startUrl, cookie) {
 			redirect: 'manual',
 		});
 		const location = res.headers.get('location');
+		debugLog(`reader hop ${hop}: ${url} ->`, res.status, location || '');
 		if (!location) break;
 		const next = new URL(location, url);
 		if (next.host === 'web-booktab.zanichelli.it' || next.host === 'webreader.zanichelli.it') return next;
@@ -1169,10 +1191,11 @@ export async function run(options = {}) {
 	const myzToken = await getMyzToken(token);
 
 	if (!myzToken) {
-		console.log("Impossibile ottenere il myz-token (il flusso di my.zanichelli.it potrebbe essere cambiato di nuovo)");
+		console.log("Impossibile ottenere il myz-token (il flusso di my.zanichelli.it potrebbe essere cambiato di nuovo). Rilancia con OURBOOKS_DEBUG=1 per i dettagli.");
 		process.exit(1);
 	}
 
+	// The browser sends ONLY the myz-token header to api-catalogo; the cookies are harmless extras.
 	const catalogHeaders = {
 		...CATALOG_BASE,
 		'myz-token': myzToken,
@@ -1182,7 +1205,6 @@ export async function run(options = {}) {
 
 	console.log("Fetching available books...");
 
-	// we don't really care about the response, but apparently it's required to access the book list
 	await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/user', {
 		headers: catalogHeaders,
 	}).then(res => res.json()).then((res) => {
@@ -1197,27 +1219,39 @@ export async function run(options = {}) {
 	const addLicense = (license) => {
 		if (!license?.volume?.ereader_url) return;
 		books[license.volume.isbn] = {
-			title: license.volume.opera?.title || license.volume.title,
+			title: license.volume.opera?.title
+				? `${license.volume.opera.title}${license.volume.title ? ' - ' + license.volume.title : ''}`
+				: license.volume.title,
 			ereader_url: license.volume.ereader_url,
 			isbns: license.volume.isbns || [],
 		};
 	};
 
-	for (let page = 1; ; page++) {
-		const response = await fetch(`https://api-catalogo.zanichelli.it/v3/dashboard/search?sort%5Bfield%5D=year_date&sort%5Bdirection%5D=desc&searchString&pageNumber=${page}&rows=100`, {
-			headers: catalogHeaders,
-		}).catch(() => null);
-		if (!response || !response.ok) break;
-		const json = await response.json().catch(() => null);
-		if (!json?.data) break;
-		(json.data.licenses || []).forEach(addLicense);
-		if (!json.data.pagination || json.data.pagination.pages <= page) break;
+	// The site only uses licenses/real now (dashboard/search is no longer called by the frontend).
+	const realRes = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/licenses/real', {
+		headers: catalogHeaders,
+	}).catch((err) => {
+		console.log("Errore richiesta licenses/real:", err.message);
+		return null;
+	});
+
+	if (!realRes || !realRes.ok) {
+		console.log("licenses/real ha risposto con errore:", realRes ? realRes.status : "nessuna risposta");
+		if (realRes) debugLog((await realRes.text().catch(() => '')).slice(0, 300));
+	} else {
+		const realJson = await realRes.json().catch(() => null);
+		debugLog("licenses/real:", (realJson?.realLicenses || []).length, "licenze");
+		(realJson?.realLicenses || []).forEach(addLicense);
 	}
 
-	const realLicenses = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/licenses/real', {
+	// Temporary licenses (e.g. delayed books), if any
+	const tempRes = await fetch('https://api-catalogo.zanichelli.it/v3/dashboard/licenses/temp?types%5B%5D=delay', {
 		headers: catalogHeaders,
-	}).then((res) => res.json()).catch(() => ({}));
-	(realLicenses.realLicenses || []).forEach(addLicense);
+	}).catch(() => null);
+	if (tempRes && tempRes.ok) {
+		const tempJson = await tempRes.json().catch(() => null);
+		(tempJson?.tempLicenses || []).forEach(addLicense);
+	}
 
 	if (!Object.keys(books).length) {
 		console.log("No books found");
