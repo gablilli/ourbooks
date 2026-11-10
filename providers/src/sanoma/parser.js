@@ -224,22 +224,26 @@ export function parseStyles(html) {
 
 
 export function decodeHtml(text) {
-  return text
-    .replace(
-      /<br\s*\/?>/gi,
-      '\n'
-    )
-    .replace(
+  let result = text.replace(
+    /<br\s*\/?>/gi,
+    '\n'
+  );
+
+  let previous;
+
+  do {
+    previous = result;
+
+    result = result.replace(
       /<[^>]+>/g,
       ''
-    )
+    );
+  } while (result !== previous);
+
+  return result
     .replace(
       /&nbsp;/gi,
       ' '
-    )
-    .replace(
-      /&amp;/gi,
-      '&'
     )
     .replace(
       /&lt;/gi,
@@ -270,6 +274,10 @@ export function decodeHtml(text) {
         String.fromCodePoint(
           parseInt(code, 10)
         )
+    )
+    .replace(
+      /&amp;/gi,
+      '&'
     );
 }
 

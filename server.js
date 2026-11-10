@@ -1,4 +1,5 @@
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import { spawn } from 'child_process';
@@ -20,9 +21,32 @@ const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
 const app = express();
+
+// set this one if you're ona reverse proxy or paas
+// otherwise the rate limit is useless
+if (process.env.TRUST_PROXY) {
+  app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
+}
+
 app.use(express.json());
-app.use('/downloads', express.static(DOWNLOADS_DIR));
-app.use(express.static(path.join(__dirname, 'ui')));
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Troppe richieste, riprova tra qualche minuto.' },
+});
+
+const staticLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use('/downloads', staticLimiter, express.static(DOWNLOADS_DIR));
+app.use(staticLimiter, express.static(path.join(__dirname, 'ui')));
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
@@ -82,11 +106,11 @@ const PROVIDERS = {
   }
 };
 
-app.get('/api/providers.js', (req, res) => {
+app.get('/api/providers.js', staticLimiter, (req, res) => {
   res.json(PROVIDERS);
 });
 
-app.post('/api/dibooklaterza-books', async (req, res) => {
+app.post('/api/dibooklaterza-books', loginLimiter, async (req, res) => {
   const { username, password } = req.body || {};
 
   if (!username || !password) {
@@ -142,7 +166,7 @@ app.post('/api/dibooklaterza-books', async (req, res) => {
   }
 });
 
-app.post('/api/sanoma-gedi', async (req, res) => {
+app.post('/api/sanoma-gedi', loginLimiter, async (req, res) => {
   const { id, password } = req.body || {};
 
   if (!id || !password) {
@@ -416,7 +440,7 @@ async function hubscuolaInternalLogin({ username, password, platform }) {
   return { tokenId, normalizedPlatform };
 }
 
-app.post('/api/hubscuola-books', async (req, res) => {
+app.post('/api/hubscuola-books', loginLimiter, async (req, res) => {
   const { username, password, platform } = req.body || {};
 
   if (!username || !password || !platform) {
@@ -461,7 +485,7 @@ app.post('/api/hubscuola-books', async (req, res) => {
   }
 });
 
-app.post('/api/bsmart-books', async (req, res) => {
+app.post('/api/bsmart-books', loginLimiter, async (req, res) => {
   const { site, username, password } = req.body || {};
   if (!site || !username || !password) {
     return res.status(400).json({ error: 'Campi richiesti: site, username, password' });
@@ -474,9 +498,9 @@ app.post('/api/bsmart-books', async (req, res) => {
     const cookieHeaders = { cookie: `_bsw_session_v1_production=${finalCookie}` };
     const user = await getUserInfo(baseSite, cookieHeaders);
     const headers = { 'auth_token': user.auth_token };
-    
+
     let books = await getBooks(baseSite, headers);
-    
+
     // Convert to useful structure
     const bookList = books.map(b => ({
       bookId: b.id,
@@ -489,7 +513,7 @@ app.post('/api/bsmart-books', async (req, res) => {
   }
 });
 
-app.post('/api/zanichelli-books', async (req, res) => {
+app.post('/api/zanichelli-books', loginLimiter, async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ error: 'Campi richiesti: username, password' });
@@ -525,6 +549,11 @@ wss.on('connection', (ws) => {
 
       if (!PROVIDERS[provider]) {
         ws.send(JSON.stringify({ type: 'error', text: 'Provider non valido.' }));
+        return;
+      }
+
+      if (activeProcess) {
+        ws.send(JSON.stringify({ type: 'error', text: 'Un processo è già in esecuzione.' }));
         return;
       }
 
