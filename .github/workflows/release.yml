@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Nome della release e tag (es. 1.4.1)"
+        required: true
+        type: string
+      summary:
+        description: "Riassunto da mostrare sotto \"What's changed\" (opzionale, supporta markdown)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Valida la versione
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Versione non valida: '$VERSION' (atteso es. 1.4.1)"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verifica che il tag non esista già
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "::error::Il tag $VERSION esiste già"
+            exit 1
+          fi
+
+      - name: Genera il changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUMMARY: ${{ inputs.summary }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # Data dell'ultima release: le PR mergeate dopo questa data finiscono nel changelog
+          SINCE=$(gh release list --limit 1 --json tagName --jq '.[0].tagName // empty' \
+            | xargs -r -I{} gh release view {} --json publishedAt --jq .publishedAt || true)
+          SINCE=${SINCE:-1970-01-01T00:00:00Z}
+          echo "Ultima release pubblicata: $SINCE"
+
+          gh pr list \
+            --state merged \
+            --base "$BASE_BRANCH" \
+            --limit 1000 \
+            --json number,title,url,mergedAt,author,labels \
+            > prs.json
+
+          {
+            echo "## What's changed"
+            echo
+            if [ -n "${SUMMARY// }" ]; then
+              printf '%s\n\n' "$SUMMARY"
+            fi
+          } > notes.md
+
+          # label -> titolo sezione (nell'ordine in cui compaiono)
+          section() {
+            local label="$1" title="$2"
+            local lines
+            lines=$(jq -r --arg since "$SINCE" --arg label "changelog:$label" '
+              [ .[]
+                | select(.mergedAt > $since)
+                | select(any(.labels[]; .name == "changelog:skip") | not)
+                | select(any(.labels[]; .name == $label))
+              ]
+              | sort_by(.mergedAt)
+              | .[]
+              | "* \(.title) by [@\(.author.login)](https://github.com/\(.author.login)) in [#\(.number)](\(.url))"
+            ' prs.json)
+            if [ -n "$lines" ]; then
+              {
+                echo "### $title"
+                echo
+                echo "$lines"
+                echo
+              } >> notes.md
+            fi
+          }
+
+          section security    "Security"
+          section feature     "Features"
+          section enhancement "Enhancements"
+          section bugfix      "Bug fixes"
+
+          echo "----- notes.md -----"
+          cat notes.md
+
+      - name: Calcola il nome dell'immagine
+        id: image
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login al registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push dell'immagine
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ inputs.version }}
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Crea la release GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --notes-file notes.md
